@@ -3,3 +3,5 @@ state.json
 *.log
 outbox/
 .local-plist-backup.plist
+__pycache__/
+*.pyc

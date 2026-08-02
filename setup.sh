@@ -2,8 +2,8 @@
 # Install/refresh the launchd service for the Claude Telegram bridge.
 #
 # The plist is GENERATED here rather than committed, so the repo carries no
-# absolute home path. LABEL keeps its historical value by default so an
-# existing install is not orphaned; override BRIDGE_LABEL on a fresh machine.
+# absolute home path or account name. Override BRIDGE_LABEL to install under
+# a different launchd label.
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LABEL="${BRIDGE_LABEL:-com.beepboop2025.claude-telegram-bridge}"
