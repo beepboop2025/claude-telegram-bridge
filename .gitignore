@@ -2,3 +2,4 @@ config.json
 state.json
 *.log
 outbox/
+.local-plist-backup.plist

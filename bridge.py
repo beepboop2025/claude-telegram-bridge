@@ -698,7 +698,7 @@ class Worker(threading.Thread):
 
 # ---------------------------------------------------------------- handlers
 
-HELP = """Claude Code bridge on the owner's Mac (v3).
+HELP = """Claude Code bridge on the host Mac (v3).
 
 Just type anything -> Claude Code runs it in the current repo; each tool
 call streams into a live progress message with a 🛑 stop button.
