@@ -26,6 +26,13 @@ bridge.LOG_PATH = os.path.join(tempfile.gettempdir(), "bridge-test.log")
 
 
 # Synthetic fixtures. Shapes only; none of these authenticate anywhere.
+#
+# Each value is deliberately SPLIT after its provider prefix ("sk_live_"
+# "51Qm..."). Adjacent Python literals concatenate at compile time, so what
+# the scanner receives is byte-identical to the joined string and these tests
+# are unchanged. The point is the file on disk: unsplit, these read as live
+# credentials to GitHub push protection (which blocked this repo on the
+# Stripe shape) and to Stripe's own scanning. Do not rejoin them.
 FAKE = {
     "private-key-block":
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEow==\n",
