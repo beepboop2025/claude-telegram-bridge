@@ -121,6 +121,194 @@ def is_sensitive(path):
             or low.endswith(_SENSITIVE_SUFFIX))
 
 
+# Telegram marks forwards differently across Bot API versions: >= 7.0 sets
+# forward_origin, older clients set forward_from / forward_from_chat /
+# forward_sender_name / forward_date, and a channel post auto-relayed into a
+# discussion group sets is_automatic_forward. Any of them means the text was
+# authored by someone other than the owner, so treat the whole set as one.
+_FORWARD_KEYS = ("forward_origin", "forward_from", "forward_from_chat",
+                 "forward_sender_name", "forward_date", "forward_signature",
+                 "is_automatic_forward")
+
+
+def is_forwarded(msg):
+    """True if this message carries text somebody else wrote."""
+    return any(msg.get(k) for k in _FORWARD_KEYS)
+
+
+# ------------------------------------------------------- MCP tool surface
+#
+# A headless `claude -p` inherits the USER-scope MCP servers from
+# ~/.claude.json. On this Mac that set includes `safari` (drives the owner's
+# logged-in browser and reads the system clipboard) and `MCP_DOCKER`. A bridge
+# run is reachable from a public Telegram bot and starts with
+# bypassPermissions, so any text the agent reads can steer it into those
+# tools. That collides head-on with the standing rule that Claude never
+# operates a logged-in session.
+#
+# So: deny by default. We name the servers we are willing to expose, copy
+# their real definitions out of the user config (never re-typing whatever
+# credentials live in their `env`), and hand claude --strict-mcp-config so
+# nothing else can load. A server added to ~/.claude.json later is excluded
+# until someone puts its name in `mcp_allow`.
+USER_MCP_PATH = os.path.expanduser("~/.claude.json")
+MCP_CONFIG_PATH = os.path.join(BASE_DIR, ".mcp-allowed.json")
+MCP_ALLOW_DEFAULT = ["seiche", "groundcheck"]
+EMPTY_MCP = '{"mcpServers": {}}'
+
+
+def select_mcp_servers(allow, user_config):
+    """Intersect the allow-list with the user's real server definitions.
+
+    Pure and total: unknown names are dropped, a malformed config yields an
+    empty set. Never raises, because the caller is on the launch path.
+    """
+    servers = (user_config or {}).get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    return {n: servers[n] for n in allow
+            if isinstance(servers.get(n), dict)}
+
+
+def write_mcp_config(allow):
+    """Materialise the allowed-server config; return a path, or None.
+
+    Returns None only if the file cannot be written, and the caller then
+    falls back to an inline empty config. Either way --strict-mcp-config
+    still goes on the command line: this narrows the tool surface, it can
+    never widen it, and it can never stop a run from starting. A file rather
+    than an inline JSON string because a server definition may carry an API
+    key in `env`, and argv is world-readable via ps.
+    """
+    try:
+        with open(USER_MCP_PATH) as f:
+            user_config = json.load(f)
+    except (OSError, ValueError) as e:
+        log(f"mcp: user config unreadable ({e.__class__.__name__}); "
+            f"running with no MCP servers")
+        user_config = {}
+    chosen = select_mcp_servers(allow, user_config)
+    try:
+        fd = os.open(MCP_CONFIG_PATH,
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"mcpServers": chosen}, f)
+    except OSError as e:
+        log(f"mcp: could not write {MCP_CONFIG_PATH} ({e}); "
+            f"falling back to an inline empty config")
+        return None
+    return MCP_CONFIG_PATH
+
+
+# ---------------------------------------------------------- secret scanning
+#
+# Output leaving this bridge lands on Telegram's servers and cannot be
+# recalled. is_sensitive() guards paths; this guards CONTENT, which is the
+# hole an injected agent actually walks through: it never has to name a
+# credential file, it just has to read one and put the value in its answer.
+#
+# Matches are reported by CLASS only. The value is never logged, never echoed
+# and never sent — printing it to explain the refusal would be the leak.
+_SECRET_PATTERNS = [
+    ("private-key-block",
+     re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("openssh-private-key",
+     re.compile(r"-----BEGIN OPENSSH PRIVATE KEY-----")),
+    ("pgp-private-key",
+     re.compile(r"-----BEGIN PGP PRIVATE KEY BLOCK-----")),
+    ("aws-access-key-id",
+     re.compile(r"\b(?:AKIA|ASIA|ABIA|ACCA|AIDA|AROA|ANPA|ANVA|AGPA)"
+                r"[0-9A-Z]{16}\b")),
+    ("telegram-bot-token",
+     re.compile(r"\b\d{8,12}:AA[0-9A-Za-z_-]{30,}")),
+    ("anthropic-or-openai-key",
+     re.compile(r"\bsk-[0-9A-Za-z_-]{16,}")),
+    ("github-token",
+     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{20,}"
+                r"|\bgithub_pat_[0-9A-Za-z_]{20,}")),
+    ("slack-token",
+     re.compile(r"\bxox[abporse]-[0-9A-Za-z-]{10,}")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("stripe-key", re.compile(r"\b[rs]k_(?:live|test)_[0-9A-Za-z]{16,}")),
+    ("jwt", re.compile(r"\beyJ[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}"
+                       r"\.[0-9A-Za-z_-]{8,}")),
+]
+
+# A high-entropy blob sitting on the right-hand side of a credential word.
+# The assignment punctuation is required on purpose: "token" is an ordinary
+# word in agent output ("2400 tokens used"), and matching mere adjacency
+# refused honest results. This wants to look like KEY=<blob>.
+# No \b around the keyword on purpose: the real-world spelling is
+# ANTHROPIC_API_KEY=..., and a word boundary cannot fall between "C" and
+# "API" because "_" is itself a word character. The length, entropy and
+# placeholder filters below carry the false-positive defence instead.
+_ASSIGNED_SECRET = re.compile(
+    r"(?i)(secret|passwd|password|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|client[_-]?secret|auth[_-]?token|bearer|"
+    r"credential|token)\W{0,4}[:=]\s*[\"']?"
+    r"([0-9A-Za-z+/_-]{24,}={0,2})")
+
+_PLACEHOLDER = re.compile(
+    r"(?i)redact|example|placeholder|your[_-]|xxxx|\*{4}|changeme|"
+    r"dummy|sample|<[a-z_]+>|\bfake\b|test[_-]?key")
+
+
+def _entropy(s):
+    """Shannon entropy in bits/char. Prose and identifiers sit low."""
+    if not s:
+        return 0.0
+    import math
+    counts = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = float(len(s))
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def scan_secrets(text):
+    """Return the sorted CLASS names of credential shapes found in text.
+
+    Empty list means nothing matched. The matched substrings are deliberately
+    not returned: no caller can then leak them by accident.
+    """
+    if not text:
+        return []
+    found = set()
+    for name, pat in _SECRET_PATTERNS:
+        if pat.search(text):
+            found.add(name)
+    for m in _ASSIGNED_SECRET.finditer(text):
+        blob = m.group(2)
+        if _PLACEHOLDER.search(blob):
+            continue
+        if _entropy(blob) < 3.4:
+            continue
+        found.add("assigned-credential-blob")
+        break
+    return sorted(found)
+
+
+def redact_secrets(text):
+    """Same detector, but blank the values instead of refusing the message.
+
+    Used on the human-driven surfaces — /sh output, the /log tail, the live
+    progress ticker. Refusing there would break routine work, and a gate that
+    breaks routine work gets deleted and then protects nothing.
+    """
+    if not text:
+        return text
+    for name, pat in _SECRET_PATTERNS:
+        text = pat.sub(f"[redacted:{name}]", text)
+
+    def _sub(m):
+        blob = m.group(2)
+        if _PLACEHOLDER.search(blob) or _entropy(blob) < 3.4:
+            return m.group(0)
+        return (m.group(0)[:m.start(2) - m.start(0)]
+                + "[redacted:assigned-credential-blob]")
+    return _ASSIGNED_SECRET.sub(_sub, text)
+
+
 def force_ipv4():
     """This network black-holes some IPv6 routes; pin to IPv4."""
     real = socket.getaddrinfo
@@ -139,6 +327,10 @@ def load_config():
     cfg.setdefault("claude_bin", os.path.expanduser("~/.local/bin/claude"))
     cfg.setdefault("kimi_bin", os.path.expanduser("~/.kimi-code/bin/kimi"))
     cfg.setdefault("claude_timeout_sec", 3600)
+    # Names only, matched against ~/.claude.json. Anything not listed here is
+    # invisible to a bridge run. Measured 2026-08-03: an unrestricted run saw
+    # 14 servers including safari, playwright, Gmail, Drive, Slack and Notion.
+    cfg.setdefault("mcp_allow", list(MCP_ALLOW_DEFAULT))
     cfg.setdefault("force_ipv4", True)
     return cfg
 
@@ -452,6 +644,12 @@ class ClaudeRun(EngineRun):
             "--permission-mode", "bypassPermissions",
             "--dangerously-skip-permissions",
         ]
+        # Deny-by-default MCP. --strict-mcp-config is what actually drops the
+        # user-scope servers; --mcp-config alone would MERGE with them and
+        # leave safari and MCP_DOCKER right where they were.
+        mcp_path = write_mcp_config(self.cfg.get("mcp_allow",
+                                                 MCP_ALLOW_DEFAULT))
+        cmd += ["--mcp-config", mcp_path or EMPTY_MCP, "--strict-mcp-config"]
         model = self.chat.get("model")
         if model and model != "default":
             cmd += ["--model", MODEL_IDS.get(model, model)]
@@ -676,8 +874,14 @@ class Worker(threading.Thread):
             tg.typing(self.chat_id)
 
         def on_event(desc):
+            # Sibling of deliver_result: the ticker also ships agent text to
+            # Telegram — tool arguments via describe_tool, and a 60-char
+            # slice of every assistant turn (kimi streams raw stdout here).
+            # A key quoted in a tool argument leaves through this message,
+            # not the result. Redact rather than refuse: killing the progress
+            # display would make the bridge feel broken.
             n_actions[0] += 1
-            actions.append(desc)
+            actions.append(redact_secrets(desc))
             with edit_lock:
                 if progress_id and time.time() - last_edit[0] >= EDIT_INTERVAL:
                     push_edit()
@@ -719,7 +923,9 @@ HELP = """Claude Code bridge on the host Mac (v3).
 Just type anything -> Claude Code runs it in the current repo; each tool
 call streams into a live progress message with a 🛑 stop button.
 Send a photo/document/voice note with a caption -> saved to this Mac,
-caption becomes the prompt (Claude gets the file path).
+caption becomes the prompt (Claude gets the file path). FORWARDED files
+and forwarded text are held instead: their words are someone else's, so
+they run only on /file <instruction> or a tap of the run button.
 
 Commands (answer instantly, even while the engine is working):
 /stop          kill the current run + clear the queue
@@ -733,6 +939,7 @@ Commands (answer instantly, even while the engine is working):
 /repos         tap-to-switch repo buttons
 /model         tap-to-pick model (fable 5 / opus / sonnet / haiku)
 /cost          today + last-7-days spend
+/file <what>   act on the last file sent (needed for forwarded files)
 /get <path>    send me a file from the Mac
 /sh <cmd>      raw shell command (bypasses Claude)
 /log [n]       tail the bridge log
@@ -790,6 +997,24 @@ class Bridge:
 
     def deliver_result(self, chat_id, raw):
         """Short results as rendered HTML; long ones as head + .md file."""
+        # Scanned before anything is sent AND before the .md is written, so
+        # neither the inline reply, the head snippet, nor the auto-attached
+        # file can carry a credential out. This is the injection surface: the
+        # agent runs with bypassPermissions and can read ~/.ssh, the vault and
+        # the gh token, so hostile text in anything it reads only has to get
+        # a value into the answer. Refuse, and name the class, never the value.
+        classes = scan_secrets(raw)
+        if classes:
+            log(f"refused to deliver result: matched {', '.join(classes)}")
+            self.tg.send(
+                chat_id,
+                "⛔️ refused to send this result: it contains something "
+                "shaped like credential material (" + ", ".join(classes)
+                + "). An upload to Telegram cannot be recalled, so nothing "
+                "was sent and nothing was written to the outbox. Read it on "
+                "the Mac, or ask again for output that does not quote the "
+                "secret.")
+            return
         if len(raw) <= LONG_RESULT:
             rendered = md_to_html(raw)
             if len(rendered) <= MAX_MSG:
@@ -822,6 +1047,19 @@ class Bridge:
                 or msg.get("audio"):
             threading.Thread(target=self._handle_file,
                              args=(chat_id, msg, w), daemon=True).start()
+        elif stripped and is_forwarded(msg):
+            # Same defect as a forwarded caption, one message type over: this
+            # text is a stranger's. It is intercepted HERE, above the command
+            # dispatch, not below it — a forwarded "/sh curl … | sh" reaching
+            # the /sh branch would run their shell line, which is worse than
+            # running their prompt. Held behind one tap, the owner's own act.
+            chat["pending_forward"] = stripped
+            self.tg.send(
+                chat_id,
+                "📨 forwarded text held — it was written by someone else, so "
+                "I did not run it as a prompt or a command.\n\n"
+                + stripped[:1200],
+                reply_markup=kb([[("▶️ run it as a prompt", "fwd:run")]]))
         elif stripped in ("/start", "/help"):
             self.tg.send(chat_id, HELP)
         elif stripped == "/stop":
@@ -906,7 +1144,24 @@ class Bridge:
             except OSError as e:
                 tail = str(e)
             tail = tail.replace(self.cfg["bot_token"], "***TOKEN***")
-            self.tg.send(chat_id, tail or "(empty)")
+            # The log records prompts and shell lines, so it inherits whatever
+            # was in them. Redacted, not refused: a single secret-shaped
+            # string in bridge.log would otherwise break /log permanently,
+            # and a debugging tool that refuses to work gets removed.
+            self.tg.send(chat_id, redact_secrets(tail) or "(empty)")
+        elif stripped.startswith("/file"):
+            instruction = (stripped.split(None, 1)[1].strip()
+                           if " " in stripped else "")
+            path = chat.get("pending_file")
+            if not path:
+                self.tg.send(chat_id, "no file waiting — send one first.")
+            elif not instruction:
+                self.tg.send(chat_id,
+                             f"📎 waiting: {path}\nsay what to do with it: "
+                             "/file summarise the tables")
+            else:
+                w.submit(f"{instruction}\n\n(The user attached a file, "
+                         f"saved at: {path})")
         elif stripped:
             pos = w.submit(stripped)
             if pos > 1:
@@ -922,6 +1177,14 @@ class Bridge:
             self.tg.answer_callback(cq["id"])
             return
         chat = self.chat_state(chat_id)
+        if data == "fwd:run":
+            pending = chat.pop("pending_forward", None)
+            if pending:
+                self.worker(chat_id).submit(pending)
+            self.tg.answer_callback(cq["id"],
+                                    "running" if pending else "nothing held")
+            self.save()
+            return
         if data == "stop":
             killed, drained = self.worker(chat_id).stop_all()
             note = "stopping…" if killed else "nothing running"
@@ -1025,14 +1288,31 @@ class Bridge:
             self.tg.send(chat_id, f"⚠️ file download failed: {e}")
             return
         caption = (msg.get("caption") or "").strip()
-        log(f"file received -> {path} (caption: {caption[:80]})")
-        if caption:
+        chat = self.chat_state(chat_id)
+        chat["pending_file"] = path
+        forwarded = is_forwarded(msg)
+        log(f"file received -> {path} (forwarded={forwarded}, "
+            f"caption: {caption[:80]})")
+        if forwarded:
+            # A forwarded caption was written by whoever posted the original,
+            # not by the owner. Auto-submitting it handed an unvetted stranger
+            # a prompt on an agent running with bypassPermissions. The file is
+            # still saved; acting on it now takes an explicit command, which
+            # is the step that turns someone else's text into her instruction.
+            self.tg.send(
+                chat_id,
+                f"📎 saved (forwarded): {path}\n\nIts caption was written by "
+                "whoever posted it, so I did not run it as a prompt. Send "
+                "/file <what to do> to act on it."
+                + (f"\n\nCaption was: {caption[:300]}" if caption else ""))
+        elif caption:
             w.submit(f"{caption}\n\n(The user attached a file, saved at: "
                      f"{path})")
         else:
             self.tg.send(chat_id,
                          f"📎 saved: {path}\nReply with what to do with "
-                         "it, or resend with a caption.")
+                         "it, or send /file <what to do>.")
+        self.save()
 
     def _send_file(self, chat_id, path):
         if not os.path.isfile(path):
@@ -1066,7 +1346,10 @@ class Bridge:
             p = subprocess.run(cmdline, shell=True, capture_output=True,
                                text=True, timeout=300, cwd=cwd)
             out = (p.stdout + p.stderr).strip() or "(no output)"
-            self.tg.send(chat_id, out[:8000])
+            # /sh is human-driven, not agent-reachable, so this is not the
+            # injection path — but `cat` on the wrong file leaks just as
+            # permanently. Redact, so the rest of the output still arrives.
+            self.tg.send(chat_id, redact_secrets(out[:8000]))
         except subprocess.TimeoutExpired:
             self.tg.send(chat_id, "⏱ shell command timed out (300s)")
 

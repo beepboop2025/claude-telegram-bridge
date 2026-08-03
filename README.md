@@ -77,3 +77,31 @@ Telegram poll loop never blocks on Claude).
   `config.json` like a password (chmod 600, gitignored).
 - If the token ever leaks: @BotFather → `/revoke`, paste the new token,
   `./setup.sh`.
+
+### Indirect prompt injection
+
+The whitelist stops other people from *messaging* the bridge. It does
+nothing about text the agent *reads* — a web page, a repo, a forwarded
+PDF — which can carry instructions of its own. Four narrowings, all
+covered by `python3 test_bridge.py`:
+
+- **Tool surface.** Runs launch with `--mcp-config` + `--strict-mcp-config`
+  against an allow-list (`mcp_allow` in `config.json`, names matched
+  against `~/.claude.json`). Deny by default. Measured 2026-08-03: an
+  unrestricted run saw 14 MCP servers, among them `safari` (the owner's
+  logged-in browser plus clipboard), `playwright`, `MCP_DOCKER`, Gmail,
+  Drive, Slack and Notion. It now sees two. Both flags are required —
+  `--mcp-config` alone merges with user scope and changes nothing.
+- **Outbound content.** `deliver_result` scans for credential shapes and
+  refuses, naming the matched class and never the value; the check runs
+  before the >3500-char auto-attach writes its `.md`. Sibling surfaces —
+  the progress ticker, `/sh`, `/log` — redact instead of refusing, so
+  routine work keeps working.
+- **Outbound paths.** `is_sensitive` still guards `/get` and `_send_file`.
+- **Forwarded messages.** A forward's text was written by someone else, so
+  it is never auto-run as a prompt or a command. The file is still saved;
+  acting on it takes `/file <instruction>` or a tap of the run button.
+  The guard sits above the command dispatch on purpose.
+
+Not covered: `/sh` is a full shell by design, and the Kimi engine has no
+per-invocation MCP flag (it loads only `openclaw`).

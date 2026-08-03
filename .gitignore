@@ -5,3 +5,4 @@ outbox/
 .local-plist-backup.plist
 __pycache__/
 *.pyc
+.mcp-allowed.json
