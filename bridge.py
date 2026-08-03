@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Telegram -> Claude Code bridge v4.
+"""Telegram -> Claude Code / Codex / Kimi bridge v5.
 
 v4: model picker includes Fable 5 (claude-fable-5); second engine — Kimi
 Code (/engine, per-directory -c continuity, errors surfaced with a renew
 hint); /attach continues the latest Claude session in the cwd (terminal
 handoff); elapsed-time ticker keeps the progress clock moving during
 long silent tool calls.
+
+v5: third engine — OpenAI Codex (`codex exec`, resumable JSONL sessions).
+Codex runs with `workspace-write` sandboxing rooted at the selected Git
+repository and asks the CLI to ignore custom user configuration by default.
+That limits writes, but Codex may still read outside the repository; outbound
+secret scanning remains a second line of defense, not a privacy boundary.
 
 Runs on this Mac. Polls Telegram (getUpdates long polling, outbound HTTPS
 only, works behind NAT). Messages from the whitelisted user are fed to
@@ -326,7 +332,15 @@ def load_config():
     cfg.setdefault("default_cwd", os.path.expanduser("~/dev"))
     cfg.setdefault("claude_bin", os.path.expanduser("~/.local/bin/claude"))
     cfg.setdefault("kimi_bin", os.path.expanduser("~/.kimi-code/bin/kimi"))
+    cfg.setdefault("codex_bin",
+                   "/Applications/ChatGPT.app/Contents/Resources/codex")
     cfg.setdefault("claude_timeout_sec", 3600)
+    cfg.setdefault("codex_timeout_sec", cfg["claude_timeout_sec"])
+    cfg.setdefault("codex_sandbox", "workspace-write")
+    # A Telegram message is a higher-risk entry point than an interactive
+    # desktop task. Do not load custom global config (including custom MCP
+    # servers) unless the owner consciously opts in via config.json.
+    cfg.setdefault("codex_ignore_user_config", True)
     # Names only, matched against ~/.claude.json. Anything not listed here is
     # invisible to a bridge run. Measured 2026-08-03: an unrestricted run saw
     # 14 servers including safari, playwright, Gmail, Drive, Slack and Notion.
@@ -795,7 +809,216 @@ class KimiRun(EngineRun):
         return {"sid": None, "ok": True, "text": out or "(empty response)"}
 
 
-ENGINES = {"claude": ClaudeRun, "kimi": KimiRun}
+def describe_codex_item(item):
+    """One compact progress line for a Codex JSONL item."""
+    kind = item.get("type") or "item"
+    if kind == "command_execution":
+        command = " ".join(str(item.get("command") or "").split())
+        return "🔧 command: " + (command[:57] + "…"
+                                if len(command) > 60 else command)
+    if kind == "mcp_tool_call":
+        server = item.get("server") or item.get("server_name") or "mcp"
+        tool = item.get("tool") or item.get("tool_name") or "tool"
+        return f"⚙️ {server}: {tool}"
+    if kind == "web_search":
+        query = " ".join(str(item.get("query") or "").split())
+        return "🌐 search: " + (query[:58] + "…"
+                               if len(query) > 61 else query)
+    if kind in ("file_change", "file_changes"):
+        return "✏️ file changes"
+    if kind not in ("agent_message", "reasoning"):
+        return "⚙️ " + kind.replace("_", " ")
+    return None
+
+
+class CodexRun(EngineRun):
+    """Streaming, resumable OpenAI Codex non-interactive run."""
+
+    def execute(self, on_event):
+        for _ in range(2):
+            result = self._run_once(on_event)
+            if not result.pop("stale", False):
+                return result
+            self.chat["codex_session_id"] = None
+        return {"sid": None, "ok": False,
+                "text": "⚠️ Codex could not resume that session. Use /new."}
+
+    def _sandbox(self):
+        sandbox = self.cfg.get("codex_sandbox", "workspace-write")
+        return (sandbox if sandbox in ("read-only", "workspace-write")
+                else "workspace-write")
+
+    def _stopped_text(self):
+        return ("⏱ timed out after "
+                + fmt_elapsed(self.cfg.get("codex_timeout_sec", 3600))
+                if self.stop_reason == "timeout" else "🛑 stopped.")
+
+    def _command(self, cwd):
+        sid = self.chat.get("codex_session_id")
+        if sid:
+            # `exec resume` has no --sandbox flag, so reassert the equivalent
+            # config value. Resume reloads configuration and must not silently
+            # widen a Telegram session after its first turn.
+            cmd = [self.cfg["codex_bin"], "exec", "resume", "--json",
+                   "-c", f'sandbox_mode="{self._sandbox()}"']
+            if self.cfg.get("codex_ignore_user_config", True):
+                cmd.append("--ignore-user-config")
+            # "--" so a chat message can never be read as a flag. Without it a
+            # prompt beginning with "--sandbox" or
+            # "--dangerously-bypass-approvals-and-sandbox" is parsed as an
+            # option and silently widens the run we just constrained.
+            return cmd + ["--", sid, self.prompt]
+
+        cmd = [self.cfg["codex_bin"], "exec", "--json", "--color", "never",
+               "--sandbox", self._sandbox(), "--cd", cwd]
+        if self.cfg.get("codex_ignore_user_config", True):
+            cmd.append("--ignore-user-config")
+        cmd.extend(["--", self.prompt])
+        return cmd
+
+    def _run_once(self, on_event):
+        cwd = self.chat.get("cwd") or self.cfg["default_cwd"]
+        if git_info(cwd) is None:
+            return {"sid": None, "ok": False,
+                    "text": ("⚠️ Codex needs a Git repository. Use /repos or "
+                             "/repo <name> first.")}
+
+        cmd = self._command(cwd)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True)
+        except FileNotFoundError:
+            return {"sid": None, "ok": False,
+                    "text": f"Codex binary not found at {self.cfg['codex_bin']}"}
+
+        proc = self.proc
+        stderr = []
+
+        def read_err():
+            try:
+                stderr.append(proc.stderr.read())
+            except Exception:
+                pass
+        threading.Thread(target=read_err, daemon=True).start()
+
+        killer = threading.Timer(self.cfg.get("codex_timeout_sec", 3600),
+                                 lambda: self.cancel("timeout"))
+        killer.daemon = True
+        killer.start()
+
+        new_sid = None
+        final_text = None
+        event_errors = []
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                event_type = event.get("type")
+                if event_type == "thread.started":
+                    new_sid = event.get("thread_id") or new_sid
+                elif event_type in ("item.started", "item.completed"):
+                    item = event.get("item") or {}
+                    if (event_type == "item.completed"
+                            and item.get("type") == "agent_message"
+                            and str(item.get("text") or "").strip()):
+                        final_text = item["text"]
+                    elif (event_type == "item.completed"
+                          and item.get("type") == "error"
+                          and item.get("message")):
+                        event_errors.append(str(item["message"]))
+                    elif event_type == "item.started":
+                        desc = describe_codex_item(item)
+                        if desc:
+                            on_event(desc)
+                elif event_type in ("error", "turn.failed"):
+                    detail = event.get("message") or event.get("error")
+                    if isinstance(detail, dict):
+                        detail = detail.get("message") or str(detail)
+                    if detail:
+                        event_errors.append(str(detail))
+        finally:
+            killer.cancel()
+            proc.wait()
+
+        err = "\n".join(stderr).strip()
+        if self.stop_reason:
+            return {"sid": new_sid or self.chat.get("codex_session_id"),
+                    "ok": False, "text": self._stopped_text()}
+        if proc.returncode == 0 and final_text:
+            return {"sid": new_sid or self.chat.get("codex_session_id"),
+                    "ok": True, "text": final_text}
+
+        detail = "\n".join(event_errors) or err or "no result"
+        lower = detail.lower()
+        stale = bool(self.chat.get("codex_session_id")
+                     and "session" in lower
+                     and ("not found" in lower or "resume" in lower))
+        return {"sid": new_sid, "ok": False, "stale": stale,
+                "text": f"⚠️ Codex exited {proc.returncode}: {detail[:1500]}"}
+
+
+ENGINES = {"claude": ClaudeRun, "codex": CodexRun, "kimi": KimiRun}
+
+
+def advance_context(chat):
+    """Invalidate queued/running jobs after an intentional context change."""
+    chat["context_generation"] = chat.get("context_generation", 0) + 1
+
+
+def snapshot_job(chat, prompt):
+    """Freeze routing while leaving per-context session chaining to Worker."""
+    return {
+        "prompt": prompt,
+        "engine": chat.get("engine", "claude"),
+        "cwd": chat["cwd"],
+        "model": chat.get("model"),
+        "generation": chat.get("context_generation", 0),
+        "session_id": chat.get("session_id"),
+        "codex_session_id": chat.get("codex_session_id"),
+        "kimi_continue": chat.get("kimi_continue", False),
+    }
+
+
+def context_matches(chat, job):
+    return (chat.get("context_generation", 0) == job["generation"]
+            and chat.get("engine", "claude") == job["engine"]
+            and chat.get("cwd") == job["cwd"]
+            and chat.get("model") == job["model"])
+
+
+def commit_context_if_current(live_chat, job, context):
+    if not context_matches(live_chat, job):
+        return False
+    live_chat["session_id"] = context["session_id"]
+    live_chat["codex_session_id"] = context["codex_session_id"]
+    if context["kimi_continue"]:
+        live_chat["kimi_continue"] = True
+    else:
+        live_chat.pop("kimi_continue", None)
+    return True
+
+
+def update_context_from_run(context, chat, engine, result):
+    """Carry session changes from a private run chat back to its queue context.
+
+    A stale-session retry clears the relevant field on ``chat``.  Preserve
+    that explicit ``None`` when the fresh retry also fails, otherwise the old
+    stale ID would be committed to the live chat again.
+    """
+    field = ("codex_session_id" if engine == "codex"
+             else "session_id" if engine == "claude" else None)
+    if field:
+        if result.get("sid") is not None:
+            chat[field] = result["sid"]
+        context[field] = chat.get(field)
+    context["kimi_continue"] = chat.get("kimi_continue", False)
 
 
 # ---------------------------------------------------------------- worker
@@ -811,9 +1034,15 @@ class Worker(threading.Thread):
         self.current = None          # ClaudeRun while busy
         self.current_started = None
         self.current_prompt = ""
+        # Sessions for immutable queued contexts. This lets queued prompts keep
+        # chaining even if the live chat switches engine/repository meanwhile.
+        self.contexts = {}
 
     def submit(self, prompt):
-        self.jobs.put(prompt)
+        with self.bridge.state_lock:
+            chat = self.bridge.chat_state(self.chat_id)
+            job = snapshot_job(chat, prompt)
+        self.jobs.put(job)
         return self.jobs.qsize() + (1 if self.current else 0)
 
     def stop_all(self):
@@ -831,9 +1060,9 @@ class Worker(threading.Thread):
 
     def run(self):
         while True:
-            prompt = self.jobs.get()
+            job = self.jobs.get()
             try:
-                self.run_job(prompt)
+                self.run_job(job)
             except Exception as e:
                 log(f"worker error: {e!r}")
                 self.bridge.tg.send(self.chat_id, f"⚠️ bridge error: {e}")
@@ -841,10 +1070,23 @@ class Worker(threading.Thread):
                 self.current = None
                 self.bridge.save()
 
-    def run_job(self, prompt):
+    def run_job(self, job):
         bridge, tg, cfg = self.bridge, self.bridge.tg, self.bridge.cfg
-        chat = bridge.chat_state(self.chat_id)
-        engine = chat.get("engine", "claude")
+        live_chat = bridge.chat_state(self.chat_id)
+        prompt = job["prompt"]
+        engine = job["engine"]
+        key = (job["generation"], engine, job["cwd"], job["model"])
+        context = self.contexts.setdefault(key, {
+            "session_id": job["session_id"],
+            "codex_session_id": job["codex_session_id"],
+            "kimi_continue": job["kimi_continue"],
+        })
+        chat = {
+            "cwd": job["cwd"],
+            "engine": engine,
+            "model": job["model"],
+            **context,
+        }
         run = ENGINES.get(engine, ClaudeRun)(cfg, chat, prompt)
         self.current = run
         self.current_started = time.time()
@@ -853,7 +1095,7 @@ class Worker(threading.Thread):
 
         actions = deque(maxlen=PROGRESS_ACTIONS)
         n_actions = [0]
-        progress_id = tg.send(self.chat_id, "⏳ starting claude…",
+        progress_id = tg.send(self.chat_id, f"⏳ starting {engine}…",
                               reply_markup=STOP_KB)
         last_edit = [time.time()]
         edit_lock = threading.Lock()
@@ -900,8 +1142,11 @@ class Worker(threading.Thread):
             result = run.execute(on_event)
         finally:
             done.set()
-        if result.get("sid"):
-            chat["session_id"] = result["sid"]
+        update_context_from_run(context, chat, engine, result)
+        # A /new, /cd, /repo, /engine, /model, or /attach issued while this
+        # job ran invalidates its right to update the live chat session.
+        with bridge.state_lock:
+            commit_context_if_current(live_chat, job, context)
         bridge.record_usage(result, n_actions[0])
 
         took = fmt_elapsed(time.time() - self.current_started)
@@ -918,7 +1163,7 @@ class Worker(threading.Thread):
 
 # ---------------------------------------------------------------- handlers
 
-HELP = """Claude Code bridge on the host Mac (v3).
+HELP = """Claude / Codex / Kimi bridge on the host Mac (v5).
 
 Just type anything -> Claude Code runs it in the current repo; each tool
 call streams into a live progress message with a 🛑 stop button.
@@ -933,7 +1178,7 @@ Commands (answer instantly, even while the engine is working):
 /new           fresh session
 /attach        continue the latest Claude session in this cwd —
                pick up exactly where the terminal left off
-/engine        tap to pick claude 🤖 or kimi 🌙
+/engine        tap to pick claude 🤖, codex 🧭, or kimi 🌙
 /cd <path>     set working directory for this chat
 /repo <name>   shortcut for /cd ~/dev/<name>
 /repos         tap-to-switch repo buttons
@@ -955,7 +1200,7 @@ class Bridge:
         self.cfg = cfg
         self.tg = Telegram(cfg["bot_token"])
         self.state = self._load_state()
-        self.state_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.started = time.time()
         self.workers = {}
 
@@ -975,9 +1220,12 @@ class Bridge:
             os.replace(tmp, STATE_PATH)
 
     def chat_state(self, chat_id):
-        return self.state["chats"].setdefault(
-            str(chat_id),
-            {"session_id": None, "cwd": self.cfg["default_cwd"]})
+        with self.state_lock:
+            chat = self.state["chats"].setdefault(
+                str(chat_id),
+                {"session_id": None, "cwd": self.cfg["default_cwd"]})
+            chat.setdefault("context_generation", 0)
+            return chat
 
     def worker(self, chat_id):
         w = self.workers.get(chat_id)
@@ -1072,12 +1320,17 @@ class Bridge:
             self.tg.send(chat_id,
                          "🛑 " + (", ".join(bits) or "nothing running"))
         elif stripped == "/new":
-            chat["session_id"] = None
-            chat.pop("kimi_continue", None)
+            with self.state_lock:
+                advance_context(chat)
+                chat["session_id"] = None
+                chat["codex_session_id"] = None
+                chat.pop("kimi_continue", None)
             self.tg.send(chat_id, "🆕 Fresh session. Cwd: " + chat["cwd"])
         elif stripped == "/attach":
-            chat["session_id"] = CONTINUE
-            chat["engine"] = "claude"
+            with self.state_lock:
+                advance_context(chat)
+                chat["session_id"] = CONTINUE
+                chat["engine"] = "claude"
             self.tg.send(chat_id,
                          "🔗 next message continues the MOST RECENT "
                          f"Claude session in {chat['cwd']} — including "
@@ -1090,7 +1343,8 @@ class Bridge:
             else:
                 self.tg.send(chat_id, "tap to pick engine:",
                              reply_markup=kb([[("🤖 claude", "engine:claude"),
-                                               ("🌙 kimi", "engine:kimi")]]))
+                                               ("🧭 codex", "engine:codex")],
+                                              [("🌙 kimi", "engine:kimi")]]))
         elif stripped == "/status":
             self.tg.send(chat_id, self._status_text(chat, w))
         elif stripped.startswith("/cd ") or stripped.startswith("/repo "):
@@ -1206,19 +1460,30 @@ class Bridge:
         self.save()
 
     def _set_engine(self, chat_id, chat, name):
-        chat["engine"] = name
+        with self.state_lock:
+            if chat.get("engine", "claude") != name:
+                advance_context(chat)
+            chat["engine"] = name
         note = f"⚙️ engine: {name}"
         if name == "kimi":
             note += ("\nnote: /model applies to claude only; kimi uses its "
                      "own default model. Session continues per-directory "
                      "via kimi -c.")
+        elif name == "codex":
+            note += ("\nnote: Codex writes are limited to the selected Git "
+                     "repo, but filesystem reads may be broader. It ignores "
+                     "custom user configuration unless enabled in "
+                     "config.json.")
         self.tg.send(chat_id, note)
 
     def _switch_dir(self, chat_id, chat, path):
         if os.path.isdir(path):
-            chat["cwd"] = path
-            chat["session_id"] = None  # sessions are per-project
-            chat.pop("kimi_continue", None)
+            with self.state_lock:
+                advance_context(chat)
+                chat["cwd"] = path
+                chat["session_id"] = None  # sessions are per-project
+                chat["codex_session_id"] = None
+                chat.pop("kimi_continue", None)
             g = git_info(path)
             note = f"📁 cwd -> {path} (fresh session)"
             if g:
@@ -1228,11 +1493,15 @@ class Bridge:
             self.tg.send(chat_id, f"❌ not a directory: {path}")
 
     def _set_model(self, chat_id, chat, arg):
+        with self.state_lock:
+            advance_context(chat)
+            if arg in ("off", "default"):
+                chat.pop("model", None)
+            else:
+                chat["model"] = arg
         if arg in ("off", "default"):
-            chat.pop("model", None)
             self.tg.send(chat_id, "🧠 model: default")
         else:
-            chat["model"] = arg
             self.tg.send(chat_id, f"🧠 model: {arg} (applies to next run)")
 
     def _status_text(self, chat, w):
@@ -1248,7 +1517,9 @@ class Bridge:
         g = git_info(chat["cwd"])
         if g:
             lines.append(f"git: {g}")
-        sid = chat["session_id"]
+        engine = chat.get("engine", "claude")
+        sid = (chat.get("codex_session_id") if engine == "codex"
+               else chat.get("session_id"))
         lines += [f"engine: {chat.get('engine', 'claude')}",
                   f"session: "
                   f"{'continue-latest' if sid == CONTINUE else sid or 'none'}",
@@ -1364,7 +1635,7 @@ class Bridge:
     def run(self):
         offset = self.state.get("offset", 0)
         allowed = set(self.cfg["allowed_user_ids"])
-        log(f"bridge v4 up; allowed users: "
+        log(f"bridge v5 up; allowed users: "
             f"{sorted(allowed) or 'NONE (setup mode)'}")
         while True:
             for upd in self.tg.get_updates(offset):
@@ -1437,6 +1708,11 @@ def check(cfg):
         print(f"✓ claude binary: {cfg['claude_bin']}")
     else:
         print(f"✗ claude binary missing: {cfg['claude_bin']}"); ok = False
+    if os.path.isfile(cfg["codex_bin"]) and os.access(cfg["codex_bin"],
+                                                      os.X_OK):
+        print(f"✓ codex binary: {cfg['codex_bin']}")
+    else:
+        print(f"✗ codex binary missing: {cfg['codex_bin']}"); ok = False
     if os.path.isdir(cfg["default_cwd"]):
         print(f"✓ default cwd: {cfg['default_cwd']}")
     else:

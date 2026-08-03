@@ -1,4 +1,4 @@
-# claude-telegram-bridge (v4)
+# claude-telegram-bridge (v5)
 
 Use Claude Code on this Mac from Telegram, anywhere. Messages you send to
 your private bot run headless Claude Code (`claude -p`, full permissions)
@@ -20,6 +20,12 @@ reported with a renew hint). **Model picker includes Fable 5**
 the most recent Claude session in the current directory — start work in
 the terminal, keep going from your phone. Elapsed-time ticker keeps the
 progress clock live during long silent tool calls.
+
+v5: **three engines** — Claude Code, OpenAI Codex, and Kimi Code. The Codex
+engine uses official `codex exec --json` automation, resumes per-chat sessions,
+and runs with `workspace-write` sandboxing rooted at the selected Git repository.
+For remote safety it asks the CLI to ignore custom user configuration by
+default; interactive Codex desktop tasks keep their normal integrations.
 
 Stdlib-only Python, long polling (no ports, no webhook, works behind NAT),
 IPv4-forced (this network black-holes some IPv6).
@@ -47,7 +53,7 @@ IPv4-forced (this network black-holes some IPv6).
 | `/cd <path>` | switch to any directory |
 | `/new` | fresh Claude session |
 | `/model` | tap-to-pick model: **fable 5** / opus / sonnet / haiku (`/model haiku` also works) |
-| `/engine` | tap to pick 🤖 claude or 🌙 kimi |
+| `/engine` | tap to pick 🤖 claude, 🧭 codex, or 🌙 kimi |
 | `/attach` | continue the latest Claude session in this cwd (terminal handoff) |
 | `/get <path>` | send a file from the Mac to the chat (≤50MB) |
 | `/sh git status` | raw shell command, no Claude |
@@ -92,6 +98,14 @@ covered by `python3 test_bridge.py`:
   logged-in browser plus clipboard), `playwright`, `MCP_DOCKER`, Gmail,
   Drive, Slack and Notion. It now sees two. Both flags are required —
   `--mcp-config` alone merges with user scope and changes nothing.
+- **Codex surface.** Telegram Codex runs use `--sandbox workspace-write` and
+  `--ignore-user-config` by default. Writes are limited to the selected
+  repository, but filesystem reads may extend beyond it; the secret scanner is
+  defense in depth, not a privacy boundary. Custom global MCP configuration is
+  not loaded. Built-in and account-level capabilities remain governed by Codex.
+  Set
+  `codex_ignore_user_config` to `false` only after accepting the wider
+  remote-control risk.
 - **Outbound content.** `deliver_result` scans for credential shapes and
   refuses, naming the matched class and never the value; the check runs
   before the >3500-char auto-attach writes its `.md`. Sibling surfaces —
