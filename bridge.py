@@ -85,19 +85,35 @@ def log(msg):
             pass
 
 
-# Credential-shaped paths /get refuses to upload. This is not a sandbox — /sh
+# Credential-shaped paths refused for upload. This is not a sandbox — /sh
 # is a full shell by design — it stops one mistyped command from putting a
 # private key or a token onto Telegram's servers, where it cannot be recalled.
-_SENSITIVE_PARTS = ("/.ssh/", "/.gnupg/", "/.aws/", "/.kube/", "/.config/gh/",
-                    "/private_vault/", "/.hermes/")
+#
+# Three gaps closed 2026-08-03 after an audit walked the real predicate over
+# real paths on this machine: the login keychain, the shell histories and the
+# whole ~/.claude tree (the memory corpus names the vault, the wallet master
+# reference and every private project) were all ALLOWED, and a `/get` of any
+# of them is one typo away.
+_SENSITIVE_PARTS = ("/.ssh/", "/.gnupg/", "/.aws/", "/.kube/", "/.config/",
+                    "/private_vault/", "/.hermes/", "/library/keychains/",
+                    "/.claude/", "/.password-store/")
 _SENSITIVE_NAMES = ("id_rsa", "id_ed25519", "id_ecdsa", "config.json",
-                    "credentials", ".env", "known_hosts")
-_SENSITIVE_SUFFIX = (".pem", ".key", ".p12", ".pfx", ".session", ".env")
+                    "credentials", ".env", "known_hosts", ".zsh_history",
+                    ".bash_history", ".python_history", ".npmrc", ".netrc",
+                    ".pgpass", ".git-credentials", ".claude.json",
+                    ".dev.vars")
+_SENSITIVE_SUFFIX = (".pem", ".key", ".p12", ".pfx", ".session", ".env",
+                     ".keychain-db", ".kdbx", ".ovpn", ".jks")
 
 
 def is_sensitive(path):
-    """True if this path looks like credential material."""
-    low = os.path.abspath(path).lower()
+    """True if this path looks like credential material.
+
+    realpath, not abspath: abspath does not resolve symlinks, while the
+    sender opens the resolved target, so a link inside any repo pointing at
+    ~/.ssh/id_ed25519 passed the check and uploaded the key.
+    """
+    low = os.path.realpath(os.path.expanduser(path)).lower()
     name = os.path.basename(low)
     return (any(p in low for p in _SENSITIVE_PARTS)
             or name in _SENSITIVE_NAMES
@@ -1021,6 +1037,16 @@ class Bridge:
     def _send_file(self, chat_id, path):
         if not os.path.isfile(path):
             self.tg.send(chat_id, f"❌ not a file: {path}")
+            return
+        # Checked here, not only in the /get branch, because this is also the
+        # auto-attach path for any agent result over the inline size limit.
+        # An agent that has been steered by hostile text in something it read
+        # reaches Telegram through here without passing /get at all.
+        if is_sensitive(path):
+            log(f"refused to send sensitive path: {path}")
+            self.tg.send(chat_id,
+                         "refused: that file looks like credential material, "
+                         "and an upload to Telegram cannot be recalled.")
             return
         size = os.path.getsize(path)
         if size > 50 * 1024 * 1024:
