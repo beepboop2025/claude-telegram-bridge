@@ -64,5 +64,4 @@ trap - EXIT HUP INT TERM
 domain="gui/$(id -u)"
 launchctl bootout "$domain" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "$domain" "$PLIST"
-launchctl kickstart -k "$domain/$LABEL"
 print "✅ bridge loaded as ${LABEL}. Logs: tail -f $DIR/bridge.log"
