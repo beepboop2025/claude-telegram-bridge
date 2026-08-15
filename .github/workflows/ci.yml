@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pinned lint tool
+        run: python -m pip install --disable-pip-version-check ruff==0.15.0
+      - name: Run behavior tests
+        run: python test_bridge.py
+      - name: Run static checks
+        run: |
+          ruff check bridge.py test_bridge.py
+          python -m py_compile bridge.py test_bridge.py
+          bash -n setup.sh
+          python - <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          with Path("launchd.plist.template").open("rb") as handle:
+              payload = plistlib.load(handle)
+          assert payload["ProcessType"] == "Background"
+          assert payload["Umask"] == 0o77
+          assert payload["ProgramArguments"] == [
+              "/usr/bin/caffeinate", "-si", "__PYTHON__",
+              "__BRIDGE__/bridge.py"]
+          PY
+
+  secrets:
+    name: Secret history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan Git history
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

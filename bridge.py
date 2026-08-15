@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram -> Claude Code / Codex / Kimi bridge v5.
+"""Telegram -> Claude Code / Codex / Kimi bridge v6.
 
 v4: model picker includes Fable 5 (claude-fable-5); second engine — Kimi
 Code (/engine, per-directory -c continuity, errors surfaced with a renew
@@ -12,6 +12,11 @@ Codex runs with `workspace-write` sandboxing rooted at the selected Git
 repository and asks the CLI to ignore custom user configuration by default.
 That limits writes, but Codex may still read outside the repository; outbound
 secret scanning remains a second line of defense, not a privacy boundary.
+
+v6: Telegram Bot API private-chat topics have isolated queues and sessions;
+prompts reach Claude and Codex over stdin; current CLI isolation flags are
+verified before launch; JSON, HTTP bodies and file transfers are bounded;
+and every local credential-bearing artifact is written atomically as 0600.
 
 Runs on this Mac. Polls Telegram (getUpdates long polling, outbound HTTPS
 only, works behind NAT). Messages from the whitelisted user are fed to
@@ -35,12 +40,15 @@ Stdlib only. No pip installs.
 import html
 import json
 import os
+import plistlib
 import queue
 import re
 import signal
 import subprocess
 import socket
+import stat
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -61,6 +69,13 @@ LONG_RESULT = 3500      # above this, attach full output as a file
 EDIT_INTERVAL = 3.0     # min seconds between progress edits (rate limits)
 PROGRESS_ACTIONS = 8    # how many recent actions to show while running
 KILL_GRACE = 8          # seconds between SIGTERM and SIGKILL
+MAX_API_RESPONSE = 8 * 1024 * 1024
+MAX_ERROR_RESPONSE = 64 * 1024
+MAX_DOWNLOAD = 20 * 1024 * 1024
+MAX_UPLOAD = 50 * 1024 * 1024
+MAX_LOCAL_JSON = 8 * 1024 * 1024
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_DIR_MODE = 0o700
 
 MODELS = ["fable", "opus", "sonnet", "haiku", "default"]
 MODEL_IDS = {"fable": "claude-fable-5"}   # friendly name -> CLI model id
@@ -70,6 +85,149 @@ CONTINUE = "__continue__"                 # session sentinel for /attach
 # ---------------------------------------------------------------- utilities
 
 _log_lock = threading.Lock()
+
+
+def strict_json_loads(raw, label="JSON"):
+    """Parse a finite JSON document and reject duplicate object keys."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="strict")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate key in {label}: {key}")
+            value[key] = item
+        return value
+
+    def reject_constant(value):
+        raise ValueError(f"nonfinite value in {label}: {value}")
+
+    return json.loads(raw, object_pairs_hook=unique_object,
+                      parse_constant=reject_constant)
+
+
+def read_bounded(response, limit, label):
+    """Read one HTTP response without trusting its declared length."""
+    declared = response.headers.get("Content-Length")
+    if declared is not None:
+        if not declared.isdigit() or int(declared) > limit:
+            raise ValueError(f"{label} exceeds {limit} bytes")
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError(f"{label} exceeds {limit} bytes")
+    return body
+
+
+def _owner_regular(info, label):
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.geteuid()):
+        raise OSError(f"unsafe private file metadata: {label}")
+
+
+def read_private(path, limit=MAX_LOCAL_JSON, missing=None):
+    """Read an owner-only regular file without following its final symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        if missing is not None:
+            return missing
+        raise
+    try:
+        info = os.fstat(fd)
+        _owner_regular(info, path)
+        if stat.S_IMODE(info.st_mode) != PRIVATE_FILE_MODE:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            body = handle.read(limit + 1)
+        if len(body) > limit:
+            raise OSError(f"private file exceeds {limit} bytes: {path}")
+        return body
+    finally:
+        os.close(fd)
+
+
+def atomic_private_write(path, body):
+    """Replace one private file atomically and durably."""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    directory = os.path.dirname(path) or "."
+    parent = os.lstat(directory)
+    if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+            or parent.st_uid != os.geteuid()):
+        raise OSError(f"unsafe private file directory: {directory}")
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}-", dir=directory)
+    try:
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(fd)
+        os.replace(temporary, path)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_private_dir(path):
+    os.makedirs(path, mode=PRIVATE_DIR_MODE, exist_ok=True)
+    info = os.lstat(path)
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()):
+        raise OSError(f"unsafe private directory: {path}")
+    if stat.S_IMODE(info.st_mode) != PRIVATE_DIR_MODE:
+        os.chmod(path, PRIVATE_DIR_MODE)
+
+
+def render_launchd_plist(template_path, output_path, label, python_path,
+                         bridge_dir, home_dir):
+    """Render one launchd plist without text substitution or array mutation."""
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", label):
+        raise ValueError("unsafe launchd label")
+    for name, value in (("python", python_path), ("bridge", bridge_dir),
+                        ("home", home_dir)):
+        if not os.path.isabs(value) or "\x00" in value:
+            raise ValueError(f"{name} path must be absolute")
+    with open(template_path, "rb") as handle:
+        payload = plistlib.load(handle)
+    payload["Label"] = label
+    payload["ProgramArguments"] = [
+        "/usr/bin/caffeinate", "-si", python_path,
+        os.path.join(bridge_dir, "bridge.py"),
+    ]
+    payload["WorkingDirectory"] = bridge_dir
+    payload["StandardOutPath"] = os.path.join(
+        bridge_dir, "launchd.out.log")
+    payload["StandardErrorPath"] = os.path.join(
+        bridge_dir, "launchd.err.log")
+    payload["EnvironmentVariables"] = {
+        "PATH": (f"{home_dir}/.local/bin:/opt/homebrew/bin:/usr/local/bin:"
+                 "/usr/bin:/bin:/usr/sbin:/sbin"),
+        "HOME": home_dir,
+    }
+    flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(output_path, flags)
+    try:
+        _owner_regular(os.fstat(fd), output_path)
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            plistlib.dump(payload, handle, sort_keys=False)
+            handle.flush()
+            os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def log(msg):
@@ -83,9 +241,19 @@ def log(msg):
             # every 10s forever. Logging must never be able to stop the bridge.
             pass
         try:
-            with open(LOG_PATH, "a") as f:
-                f.write(line + "\n")
-            if os.path.getsize(LOG_PATH) > 8 * 1024 * 1024:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(LOG_PATH, flags, PRIVATE_FILE_MODE)
+            try:
+                info = os.fstat(fd)
+                _owner_regular(info, LOG_PATH)
+                os.fchmod(fd, PRIVATE_FILE_MODE)
+                os.write(fd, (line + "\n").encode("utf-8", errors="replace"))
+                size = os.fstat(fd).st_size
+            finally:
+                os.close(fd)
+            if size > 8 * 1024 * 1024:
                 os.replace(LOG_PATH, LOG_PATH + ".1")
         except OSError:
             pass
@@ -159,7 +327,7 @@ def is_forwarded(msg):
 # until someone puts its name in `mcp_allow`.
 USER_MCP_PATH = os.path.expanduser("~/.claude.json")
 MCP_CONFIG_PATH = os.path.join(BASE_DIR, ".mcp-allowed.json")
-MCP_ALLOW_DEFAULT = ["seiche", "groundcheck"]
+MCP_ALLOW_DEFAULT = ["seiche", "liquilens", "undertow", "groundcheck"]
 EMPTY_MCP = '{"mcpServers": {}}'
 
 
@@ -187,18 +355,17 @@ def write_mcp_config(allow):
     key in `env`, and argv is world-readable via ps.
     """
     try:
-        with open(USER_MCP_PATH) as f:
-            user_config = json.load(f)
-    except (OSError, ValueError) as e:
+        user_config = strict_json_loads(
+            read_private(USER_MCP_PATH, missing=b"{}"), USER_MCP_PATH)
+    except (OSError, TypeError, ValueError) as e:
         log(f"mcp: user config unreadable ({e.__class__.__name__}); "
             f"running with no MCP servers")
         user_config = {}
     chosen = select_mcp_servers(allow, user_config)
     try:
-        fd = os.open(MCP_CONFIG_PATH,
-                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"mcpServers": chosen}, f)
+        payload = json.dumps({"mcpServers": chosen}, sort_keys=True,
+                             separators=(",", ":")) + "\n"
+        atomic_private_write(MCP_CONFIG_PATH, payload)
     except OSError as e:
         log(f"mcp: could not write {MCP_CONFIG_PATH} ({e}); "
             f"falling back to an inline empty config")
@@ -326,8 +493,9 @@ def force_ipv4():
 
 
 def load_config():
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
+    cfg = strict_json_loads(read_private(CONFIG_PATH), CONFIG_PATH)
+    if not isinstance(cfg, dict):
+        raise ValueError("config.json must contain one JSON object")
     cfg.setdefault("allowed_user_ids", [])
     cfg.setdefault("default_cwd", os.path.expanduser("~/dev"))
     cfg.setdefault("claude_bin", os.path.expanduser("~/.local/bin/claude"))
@@ -341,11 +509,54 @@ def load_config():
     # desktop task. Do not load custom global config (including custom MCP
     # servers) unless the owner consciously opts in via config.json.
     cfg.setdefault("codex_ignore_user_config", True)
+    cfg.setdefault("codex_ignore_rules", True)
+    # Keep repository-owned settings and instructions, but do not inherit
+    # user/local hooks and plugins into a full-permission remote session.
+    cfg.setdefault("claude_setting_sources", "project")
     # Names only, matched against ~/.claude.json. Anything not listed here is
     # invisible to a bridge run. Measured 2026-08-03: an unrestricted run saw
     # 14 servers including safari, playwright, Gmail, Drive, Slack and Notion.
     cfg.setdefault("mcp_allow", list(MCP_ALLOW_DEFAULT))
     cfg.setdefault("force_ipv4", True)
+
+    if not isinstance(cfg.get("bot_token"), str):
+        raise ValueError("bot_token must be a string")
+    allowed = cfg["allowed_user_ids"]
+    if (not isinstance(allowed, list)
+            or any(isinstance(value, bool) or not isinstance(value, int)
+                   or value <= 0 for value in allowed)
+            or len(set(allowed)) != len(allowed)):
+        raise ValueError("allowed_user_ids must be unique positive integers")
+    for name in ("default_cwd", "claude_bin", "kimi_bin", "codex_bin"):
+        if not isinstance(cfg[name], str) or not cfg[name].strip():
+            raise ValueError(f"{name} must be a nonempty path string")
+        cfg[name] = os.path.realpath(os.path.expanduser(cfg[name]))
+    for name in ("claude_timeout_sec", "codex_timeout_sec"):
+        value = cfg[name]
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or not 30 <= value <= 86400):
+            raise ValueError(f"{name} must be an integer from 30 to 86400")
+    for name in ("codex_ignore_user_config", "codex_ignore_rules",
+                 "force_ipv4"):
+        if not isinstance(cfg[name], bool):
+            raise ValueError(f"{name} must be true or false")
+    if cfg["codex_sandbox"] not in ("read-only", "workspace-write"):
+        raise ValueError("codex_sandbox must be read-only or workspace-write")
+    allow = cfg["mcp_allow"]
+    if (not isinstance(allow, list)
+            or any(not isinstance(name, str) or not name
+                   or len(name) > 128 or any(ord(ch) < 32 for ch in name)
+                   for name in allow)
+            or len(set(allow)) != len(allow)):
+        raise ValueError("mcp_allow must contain unique safe server names")
+    sources = cfg["claude_setting_sources"]
+    if not isinstance(sources, str):
+        raise ValueError("claude_setting_sources must be a comma-separated string")
+    source_parts = [part.strip() for part in sources.split(",") if part.strip()]
+    if (not source_parts or len(set(source_parts)) != len(source_parts)
+            or not set(source_parts) <= {"user", "project", "local"}):
+        raise ValueError("claude_setting_sources may use user, project, local")
+    cfg["claude_setting_sources"] = ",".join(source_parts)
     return cfg
 
 
@@ -417,19 +628,39 @@ class Telegram:
             req = urllib.request.Request(f"{self.api}/{method}", data=data)
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return json.load(resp)
+                    payload = strict_json_loads(
+                        read_bounded(resp, MAX_API_RESPONSE,
+                                     f"Telegram {method} response"),
+                        f"Telegram {method} response")
+                if not isinstance(payload, dict) or payload.get("ok") is not True:
+                    description = (payload.get("description")
+                                   if isinstance(payload, dict) else None)
+                    raise TelegramError(description or
+                                        f"{method}: malformed API response")
+                return payload
             except urllib.error.HTTPError as e:
                 try:
-                    body = json.load(e)
-                except Exception:
+                    body = strict_json_loads(
+                        read_bounded(e, MAX_ERROR_RESPONSE,
+                                     f"Telegram {method} error"),
+                        f"Telegram {method} error")
+                except (TypeError, UnicodeError, ValueError):
+                    body = {}
+                if not isinstance(body, dict):
                     body = {}
                 desc = body.get("description", f"HTTP {e.code}")
                 if e.code == 429 and attempt < retries:
-                    wait = (body.get("parameters") or {}).get("retry_after", 3)
+                    parameters = body.get("parameters")
+                    if not isinstance(parameters, dict):
+                        parameters = {}
+                    wait = parameters.get("retry_after", 3)
+                    if isinstance(wait, bool) or not isinstance(wait, int):
+                        wait = 3
+                    wait = min(max(wait, 1), 300)
                     log(f"telegram 429 on {method}; retrying in {wait}s")
                     time.sleep(wait + 0.5)
                     continue
-                raise TelegramError(desc) from None
+                raise TelegramError(f"HTTP {e.code}: {desc}") from None
         raise TelegramError(f"{method}: retries exhausted")
 
     def get_updates(self, offset):
@@ -460,7 +691,7 @@ class Telegram:
             time.sleep(backoff)
             return []
 
-    def send(self, chat_id, text, reply_markup=None):
+    def send(self, chat_id, text, reply_markup=None, message_thread_id=None):
         """Plain-text send (chunked). Returns message_id of first chunk."""
         if not text.strip():
             text = "(empty response)"
@@ -468,6 +699,8 @@ class Telegram:
         chunks = [text[i:i + MAX_MSG] for i in range(0, len(text), MAX_MSG)]
         for chunk in chunks:
             params = {"chat_id": chat_id, "text": chunk}
+            if message_thread_id is not None:
+                params["message_thread_id"] = message_thread_id
             if reply_markup and first_id is None:
                 params["reply_markup"] = reply_markup
             try:
@@ -479,16 +712,20 @@ class Telegram:
                 first_id = r["result"].get("message_id")
         return first_id
 
-    def send_html(self, chat_id, html_text, fallback_plain):
+    def send_html(self, chat_id, html_text, fallback_plain,
+                  message_thread_id=None):
         """Single-message HTML send; falls back to plain chunks."""
         try:
             self.call("sendMessage",
                       {"chat_id": chat_id, "text": html_text,
                        "parse_mode": "HTML",
-                       "disable_web_page_preview": "true"})
+                       "disable_web_page_preview": "true",
+                       **({"message_thread_id": message_thread_id}
+                          if message_thread_id is not None else {})})
         except Exception as e:
             log(f"HTML send failed ({e}); falling back to plain")
-            self.send(chat_id, fallback_plain)
+            self.send(chat_id, fallback_plain,
+                      message_thread_id=message_thread_id)
 
     def edit(self, chat_id, message_id, text, reply_markup=None):
         params = {"chat_id": chat_id, "message_id": message_id,
@@ -509,44 +746,99 @@ class Telegram:
         except Exception:
             pass
 
-    def typing(self, chat_id):
+    def typing(self, chat_id, message_thread_id=None):
         try:
-            self.call("sendChatAction",
-                      {"chat_id": chat_id, "action": "typing"},
+            params = {"chat_id": chat_id, "action": "typing"}
+            if message_thread_id is not None:
+                params["message_thread_id"] = message_thread_id
+            self.call("sendChatAction", params,
                       timeout=10, retries=0)
         except Exception:
             pass
 
-    def download(self, file_id, dest_dir):
+    def download(self, file_id, dest_dir, name_hint=None):
         """Fetch a Telegram file to dest_dir; returns local path."""
         r = self.call("getFile", {"file_id": file_id}, timeout=30)
-        remote = r["result"]["file_path"]
-        os.makedirs(dest_dir, exist_ok=True)
-        name = os.path.basename(remote) or f"file-{file_id[:8]}"
-        dest = os.path.join(dest_dir, f"{time.strftime('%H%M%S')}-{name}")
-        url = f"https://api.telegram.org/file/bot{self.token}/{remote}"
-        with urllib.request.urlopen(url, timeout=300) as resp, \
-                open(dest, "wb") as f:
-            while True:
-                block = resp.read(65536)
-                if not block:
-                    break
-                f.write(block)
-        return dest
+        result = r.get("result")
+        if not isinstance(result, dict):
+            raise TelegramError("getFile returned no file object")
+        remote = result.get("file_path")
+        size = result.get("file_size")
+        if not isinstance(remote, str) or not remote or "\x00" in remote:
+            raise TelegramError("getFile returned an invalid file path")
+        if (size is not None
+                and (isinstance(size, bool) or not isinstance(size, int)
+                     or size < 0 or size > MAX_DOWNLOAD)):
+            raise TelegramError("Telegram file exceeds the 20 MiB download limit")
+        ensure_private_dir(dest_dir)
+        suggested = os.path.basename(name_hint or remote)
+        safe_name = re.sub(r"[^0-9A-Za-z._-]+", "_", suggested)[:120]
+        safe_name = safe_name.strip(".") or f"file-{str(file_id)[:8]}"
+        fd, dest = tempfile.mkstemp(
+            prefix=f"{time.strftime('%H%M%S')}-", suffix="-" + safe_name,
+            dir=dest_dir)
+        try:
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+            remote_url = urllib.parse.quote(remote, safe="/")
+            url = f"https://api.telegram.org/file/bot{self.token}/{remote_url}"
+            with urllib.request.urlopen(url, timeout=300) as resp:
+                declared = resp.headers.get("Content-Length")
+                if (declared is not None
+                        and (not declared.isdigit()
+                             or int(declared) > MAX_DOWNLOAD)):
+                    raise TelegramError("Telegram download exceeds 20 MiB")
+                total = 0
+                while True:
+                    block = resp.read(min(65536, MAX_DOWNLOAD - total + 1))
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > MAX_DOWNLOAD:
+                        raise TelegramError("Telegram download exceeds 20 MiB")
+                    os.write(fd, block)
+            os.fsync(fd)
+            return dest
+        except Exception:
+            try:
+                os.unlink(dest)
+            except FileNotFoundError:
+                pass
+            raise
+        finally:
+            os.close(fd)
 
-    def send_document(self, chat_id, path, caption=""):
+    def send_document(self, chat_id, path, caption="", message_thread_id=None):
         boundary = uuid.uuid4().hex
-        with open(path, "rb") as f:
-            file_data = f.read()
+        resolved = os.path.realpath(path)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(resolved, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise TelegramError("document is not a regular file")
+            if info.st_size > MAX_UPLOAD:
+                raise TelegramError("document exceeds Telegram's 50 MiB limit")
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                file_data = handle.read(MAX_UPLOAD + 1)
+            if len(file_data) > MAX_UPLOAD:
+                raise TelegramError("document exceeds Telegram's 50 MiB limit")
+        finally:
+            os.close(fd)
         parts = []
-        for name, value in (("chat_id", str(chat_id)),
-                            ("caption", caption[:1000])):
+        fields = [("chat_id", str(chat_id)), ("caption", caption[:1000])]
+        if message_thread_id is not None:
+            fields.append(("message_thread_id", str(message_thread_id)))
+        for name, value in fields:
+            value = value.replace("\r", " ").replace("\n", " ")
             parts.append(
                 f"--{boundary}\r\nContent-Disposition: form-data; "
                 f"name=\"{name}\"\r\n\r\n{value}\r\n".encode())
+        filename = re.sub(r"[^0-9A-Za-z._-]+", "_",
+                          os.path.basename(resolved))[:160] or "document.bin"
         parts.append(
             f"--{boundary}\r\nContent-Disposition: form-data; "
-            f"name=\"document\"; filename=\"{os.path.basename(path)}\"\r\n"
+            f"name=\"document\"; filename=\"{filename}\"\r\n"
             f"Content-Type: application/octet-stream\r\n\r\n".encode())
         parts.append(file_data)
         parts.append(f"\r\n--{boundary}--\r\n".encode())
@@ -556,7 +848,13 @@ class Telegram:
             headers={"Content-Type":
                      f"multipart/form-data; boundary={boundary}"})
         with urllib.request.urlopen(req, timeout=300) as resp:
-            return json.load(resp)
+            payload = strict_json_loads(
+                read_bounded(resp, MAX_API_RESPONSE,
+                             "Telegram sendDocument response"),
+                "Telegram sendDocument response")
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise TelegramError("sendDocument returned a malformed response")
+        return payload
 
 
 # ---------------------------------------------------------------- claude
@@ -653,10 +951,13 @@ class ClaudeRun(EngineRun):
 
     def _run_once(self, on_event):
         cmd = [
-            self.cfg["claude_bin"], "-p", self.prompt,
+            self.cfg["claude_bin"], "-p",
             "--output-format", "stream-json", "--verbose",
             "--permission-mode", "bypassPermissions",
             "--dangerously-skip-permissions",
+            "--setting-sources", self.cfg.get(
+                "claude_setting_sources", "project"),
+            "--no-chrome",
         ]
         # Deny-by-default MCP. --strict-mcp-config is what actually drops the
         # user-scope servers; --mcp-config alone would MERGE with them and
@@ -676,7 +977,8 @@ class ClaudeRun(EngineRun):
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=self.chat.get("cwd") or self.cfg["default_cwd"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
                 start_new_session=True)
         except FileNotFoundError:
             return {"sid": None, "ok": False,
@@ -685,6 +987,10 @@ class ClaudeRun(EngineRun):
 
         self._stderr = ""
         proc = self.proc
+        process_input = getattr(proc, "stdin", None)
+        if process_input is not None:
+            process_input.write(self.prompt)
+            process_input.close()
 
         def read_err():
             try:
@@ -755,7 +1061,7 @@ class KimiRun(EngineRun):
     """
 
     def execute(self, on_event):
-        cmd = [self.cfg["kimi_bin"], "-p", self.prompt,
+        cmd = [self.cfg["kimi_bin"], f"--prompt={self.prompt}",
                "--output-format", "text"]
         if self.chat.get("kimi_continue"):
             cmd += ["-c"]
@@ -863,17 +1169,21 @@ class CodexRun(EngineRun):
                    "-c", f'sandbox_mode="{self._sandbox()}"']
             if self.cfg.get("codex_ignore_user_config", True):
                 cmd.append("--ignore-user-config")
+            if self.cfg.get("codex_ignore_rules", True):
+                cmd.append("--ignore-rules")
             # "--" so a chat message can never be read as a flag. Without it a
             # prompt beginning with "--sandbox" or
             # "--dangerously-bypass-approvals-and-sandbox" is parsed as an
             # option and silently widens the run we just constrained.
-            return cmd + ["--", sid, self.prompt]
+            return cmd + ["--", sid, "-"]
 
         cmd = [self.cfg["codex_bin"], "exec", "--json", "--color", "never",
                "--sandbox", self._sandbox(), "--cd", cwd]
         if self.cfg.get("codex_ignore_user_config", True):
             cmd.append("--ignore-user-config")
-        cmd.extend(["--", self.prompt])
+        if self.cfg.get("codex_ignore_rules", True):
+            cmd.append("--ignore-rules")
+        cmd.extend(["--", "-"])
         return cmd
 
     def _run_once(self, on_event):
@@ -886,7 +1196,7 @@ class CodexRun(EngineRun):
         cmd = self._command(cwd)
         try:
             self.proc = subprocess.Popen(
-                cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+                cmd, cwd=cwd, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, start_new_session=True)
         except FileNotFoundError:
@@ -894,6 +1204,10 @@ class CodexRun(EngineRun):
                     "text": f"Codex binary not found at {self.cfg['codex_bin']}"}
 
         proc = self.proc
+        process_input = getattr(proc, "stdin", None)
+        if process_input is not None:
+            process_input.write(self.prompt)
+            process_input.close()
         stderr = []
 
         def read_err():
@@ -967,6 +1281,17 @@ class CodexRun(EngineRun):
 ENGINES = {"claude": ClaudeRun, "codex": CodexRun, "kimi": KimiRun}
 
 
+def message_thread_id(message):
+    value = (message or {}).get("message_thread_id")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def conversation_key(chat_id, thread_id=None):
+    return str(chat_id) if thread_id is None else f"{chat_id}:{thread_id}"
+
+
 def advance_context(chat):
     """Invalidate queued/running jobs after an intentional context change."""
     chat["context_generation"] = chat.get("context_generation", 0) + 1
@@ -1026,10 +1351,11 @@ def update_context_from_run(context, chat, engine, result):
 class Worker(threading.Thread):
     """Per-chat job runner: main loop stays free to answer commands."""
 
-    def __init__(self, bridge, chat_id):
+    def __init__(self, bridge, chat_id, thread_id=None):
         super().__init__(daemon=True)
         self.bridge = bridge
         self.chat_id = chat_id
+        self.thread_id = thread_id
         self.jobs = queue.Queue()
         self.current = None          # ClaudeRun while busy
         self.current_started = None
@@ -1040,7 +1366,7 @@ class Worker(threading.Thread):
 
     def submit(self, prompt):
         with self.bridge.state_lock:
-            chat = self.bridge.chat_state(self.chat_id)
+            chat = self.bridge.chat_state(self.chat_id, self.thread_id)
             job = snapshot_job(chat, prompt)
         self.jobs.put(job)
         return self.jobs.qsize() + (1 if self.current else 0)
@@ -1065,14 +1391,16 @@ class Worker(threading.Thread):
                 self.run_job(job)
             except Exception as e:
                 log(f"worker error: {e!r}")
-                self.bridge.tg.send(self.chat_id, f"⚠️ bridge error: {e}")
+                self.bridge.tg.send(
+                    self.chat_id, f"⚠️ bridge error: {e}",
+                    message_thread_id=self.thread_id)
             finally:
                 self.current = None
                 self.bridge.save()
 
     def run_job(self, job):
         bridge, tg, cfg = self.bridge, self.bridge.tg, self.bridge.cfg
-        live_chat = bridge.chat_state(self.chat_id)
+        live_chat = bridge.chat_state(self.chat_id, self.thread_id)
         prompt = job["prompt"]
         engine = job["engine"]
         key = (job["generation"], engine, job["cwd"], job["model"])
@@ -1095,8 +1423,9 @@ class Worker(threading.Thread):
 
         actions = deque(maxlen=PROGRESS_ACTIONS)
         n_actions = [0]
-        progress_id = tg.send(self.chat_id, f"⏳ starting {engine}…",
-                              reply_markup=STOP_KB)
+        progress_id = tg.send(
+            self.chat_id, f"⏳ starting {engine}…", reply_markup=STOP_KB,
+            message_thread_id=self.thread_id)
         last_edit = [time.time()]
         edit_lock = threading.Lock()
 
@@ -1113,7 +1442,7 @@ class Worker(threading.Thread):
             last_edit[0] = time.time()
             tg.edit(self.chat_id, progress_id, render(),
                     reply_markup=STOP_KB)
-            tg.typing(self.chat_id)
+            tg.typing(self.chat_id, message_thread_id=self.thread_id)
 
         def on_event(desc):
             # Sibling of deliver_result: the ticker also ships agent text to
@@ -1158,12 +1487,13 @@ class Worker(threading.Thread):
             else:
                 summary = f"⚠️ ended · {took}"
             tg.edit(self.chat_id, progress_id, summary)  # keyboard drops off
-        bridge.deliver_result(self.chat_id, result["text"])
+        bridge.deliver_result(
+            self.chat_id, result["text"], message_thread_id=self.thread_id)
 
 
 # ---------------------------------------------------------------- handlers
 
-HELP = """Claude / Codex / Kimi bridge on the host Mac (v5).
+HELP = """Claude / Codex / Kimi bridge on the host Mac (v6).
 
 Just type anything -> Claude Code runs it in the current repo; each tool
 call streams into a live progress message with a 🛑 stop button.
@@ -1207,43 +1537,53 @@ class Bridge:
     @staticmethod
     def _load_state():
         try:
-            with open(STATE_PATH) as f:
-                return json.load(f)
-        except (OSError, ValueError):
+            raw = read_private(STATE_PATH)
+        except FileNotFoundError:
             return {"chats": {}}
+        state = strict_json_loads(raw, STATE_PATH)
+        if not isinstance(state, dict) or not isinstance(state.get("chats"), dict):
+            raise ValueError("state.json must contain a chats object")
+        offset = state.get("offset", 0)
+        if (isinstance(offset, bool) or not isinstance(offset, int)
+                or offset < 0):
+            raise ValueError("state.json offset must be a nonnegative integer")
+        if "usage" in state and not isinstance(state["usage"], dict):
+            raise ValueError("state.json usage must be an object")
+        return state
 
     def save(self):
         with self.state_lock:
-            tmp = STATE_PATH + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.state, f, indent=2)
-            os.replace(tmp, STATE_PATH)
+            body = json.dumps(self.state, indent=2, sort_keys=True,
+                              allow_nan=False) + "\n"
+            atomic_private_write(STATE_PATH, body)
 
-    def chat_state(self, chat_id):
+    def chat_state(self, chat_id, thread_id=None):
         with self.state_lock:
             chat = self.state["chats"].setdefault(
-                str(chat_id),
+                conversation_key(chat_id, thread_id),
                 {"session_id": None, "cwd": self.cfg["default_cwd"]})
             chat.setdefault("context_generation", 0)
             return chat
 
-    def worker(self, chat_id):
-        w = self.workers.get(chat_id)
+    def worker(self, chat_id, thread_id=None):
+        key = (chat_id, thread_id)
+        w = self.workers.get(key)
         if w is None or not w.is_alive():
-            w = self.workers[chat_id] = Worker(self, chat_id)
+            w = self.workers[key] = Worker(self, chat_id, thread_id)
             w.start()
         return w
 
     def record_usage(self, result, n_actions):
-        day = time.strftime("%Y-%m-%d")
-        u = self.state.setdefault("usage", {}).setdefault(
-            day, {"cost": 0.0, "runs": 0, "actions": 0})
-        u["runs"] += 1
-        u["actions"] += n_actions
-        if result.get("cost"):
-            u["cost"] += result["cost"]
+        with self.state_lock:
+            day = time.strftime("%Y-%m-%d")
+            u = self.state.setdefault("usage", {}).setdefault(
+                day, {"cost": 0.0, "runs": 0, "actions": 0})
+            u["runs"] += 1
+            u["actions"] += n_actions
+            if result.get("cost"):
+                u["cost"] += result["cost"]
 
-    def deliver_result(self, chat_id, raw):
+    def deliver_result(self, chat_id, raw, message_thread_id=None):
         """Short results as rendered HTML; long ones as head + .md file."""
         # Scanned before anything is sent AND before the .md is written, so
         # neither the inline reply, the head snippet, nor the auto-attached
@@ -1261,35 +1601,56 @@ class Bridge:
                 + "). An upload to Telegram cannot be recalled, so nothing "
                 "was sent and nothing was written to the outbox. Read it on "
                 "the Mac, or ask again for output that does not quote the "
-                "secret.")
+                "secret.", message_thread_id=message_thread_id)
             return
         if len(raw) <= LONG_RESULT:
             rendered = md_to_html(raw)
             if len(rendered) <= MAX_MSG:
-                self.tg.send_html(chat_id, rendered, raw)
+                self.tg.send_html(
+                    chat_id, rendered, raw,
+                    message_thread_id=message_thread_id)
             else:
-                self.tg.send(chat_id, raw)
+                self.tg.send(
+                    chat_id, raw, message_thread_id=message_thread_id)
             return
-        os.makedirs(OUTBOX_DIR, exist_ok=True)
-        path = os.path.join(OUTBOX_DIR,
-                            f"result-{time.strftime('%H%M%S')}.md")
-        with open(path, "w") as f:
-            f.write(raw)
-        head = raw[:2500].rsplit("\n", 1)[0]
-        self.tg.send(chat_id, head + "\n\n… (full output attached)")
+        ensure_private_dir(OUTBOX_DIR)
+        fd, path = tempfile.mkstemp(
+            prefix=f"result-{time.strftime('%H%M%S')}-", suffix=".md",
+            dir=OUTBOX_DIR)
         try:
-            self.tg.send_document(chat_id, path, "full output")
+            os.fchmod(fd, PRIVATE_FILE_MODE)
+            with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        head = raw[:2500].rsplit("\n", 1)[0]
+        self.tg.send(
+            chat_id, head + "\n\n… (full output attached)",
+            message_thread_id=message_thread_id)
+        try:
+            self.tg.send_document(
+                chat_id, path, "full output",
+                message_thread_id=message_thread_id)
         except Exception as e:
             log(f"result attach failed: {e}")
-            self.tg.send(chat_id, raw)  # fall back to chunks
+            self.tg.send(
+                chat_id, raw, message_thread_id=message_thread_id)
 
     # ------------------------------------------------------------ commands
 
     def handle(self, chat_id, msg):
         text = msg.get("text") or ""
         stripped = text.strip()
-        chat = self.chat_state(chat_id)
-        w = self.worker(chat_id)
+        thread_id = message_thread_id(msg)
+        chat = self.chat_state(chat_id, thread_id)
+        w = self.worker(chat_id, thread_id)
+
+        def reply(body, reply_markup=None):
+            return self.tg.send(
+                chat_id, body, reply_markup=reply_markup,
+                message_thread_id=thread_id)
 
         if msg.get("document") or msg.get("photo") or msg.get("voice") \
                 or msg.get("audio"):
@@ -1302,14 +1663,13 @@ class Bridge:
             # the /sh branch would run their shell line, which is worse than
             # running their prompt. Held behind one tap, the owner's own act.
             chat["pending_forward"] = stripped
-            self.tg.send(
-                chat_id,
+            reply(
                 "📨 forwarded text held — it was written by someone else, so "
                 "I did not run it as a prompt or a command.\n\n"
                 + stripped[:1200],
                 reply_markup=kb([[("▶️ run it as a prompt", "fwd:run")]]))
         elif stripped in ("/start", "/help"):
-            self.tg.send(chat_id, HELP)
+            reply(HELP)
         elif stripped == "/stop":
             killed, drained = w.stop_all()
             bits = []
@@ -1317,41 +1677,39 @@ class Bridge:
                 bits.append("killed current run")
             if drained:
                 bits.append(f"dropped {drained} queued")
-            self.tg.send(chat_id,
-                         "🛑 " + (", ".join(bits) or "nothing running"))
+            reply("🛑 " + (", ".join(bits) or "nothing running"))
         elif stripped == "/new":
             with self.state_lock:
                 advance_context(chat)
                 chat["session_id"] = None
                 chat["codex_session_id"] = None
                 chat.pop("kimi_continue", None)
-            self.tg.send(chat_id, "🆕 Fresh session. Cwd: " + chat["cwd"])
+            reply("🆕 Fresh session. Cwd: " + chat["cwd"])
         elif stripped == "/attach":
             with self.state_lock:
                 advance_context(chat)
                 chat["session_id"] = CONTINUE
                 chat["engine"] = "claude"
-            self.tg.send(chat_id,
-                         "🔗 next message continues the MOST RECENT "
-                         f"Claude session in {chat['cwd']} — including "
-                         "one started in the terminal.")
+            reply("🔗 next message continues the MOST RECENT "
+                  f"Claude session in {chat['cwd']}, including "
+                  "one started in the terminal.")
         elif stripped.startswith("/engine"):
             arg = (stripped.split(None, 1)[1].strip().lower()
                    if " " in stripped else "")
             if arg in ENGINES:
-                self._set_engine(chat_id, chat, arg)
+                self._set_engine(chat_id, chat, arg, thread_id)
             else:
-                self.tg.send(chat_id, "tap to pick engine:",
-                             reply_markup=kb([[("🤖 claude", "engine:claude"),
-                                               ("🧭 codex", "engine:codex")],
-                                              [("🌙 kimi", "engine:kimi")]]))
+                reply("tap to pick engine:",
+                      reply_markup=kb([[("🤖 claude", "engine:claude"),
+                                        ("🧭 codex", "engine:codex")],
+                                       [("🌙 kimi", "engine:kimi")]]))
         elif stripped == "/status":
-            self.tg.send(chat_id, self._status_text(chat, w))
+            reply(self._status_text(chat, w))
         elif stripped.startswith("/cd ") or stripped.startswith("/repo "):
             arg = stripped.split(None, 1)[1].strip()
             path = (os.path.expanduser(arg) if stripped.startswith("/cd ")
                     else os.path.expanduser(f"~/dev/{arg}"))
-            self._switch_dir(chat_id, chat, path)
+            self._switch_dir(chat_id, chat, path, thread_id)
         elif stripped == "/repos":
             root = os.path.expanduser("~/dev")
             dirs = sorted(d for d in os.listdir(root)
@@ -1359,42 +1717,42 @@ class Bridge:
                           and not d.startswith("."))
             rows = [[(d, f"repo:{d}") for d in dirs[i:i + 2]]
                     for i in range(0, len(dirs), 2)]
-            self.tg.send(chat_id, "tap to switch repo:",
-                         reply_markup=kb(rows[:50]))
+            reply("tap to switch repo:", reply_markup=kb(rows[:50]))
         elif stripped.startswith("/model"):
             arg = (stripped.split(None, 1)[1].strip()
                    if " " in stripped else "")
             if arg:
-                self._set_model(chat_id, chat, arg)
+                self._set_model(chat_id, chat, arg, thread_id)
             else:
-                self.tg.send(chat_id, "tap to pick model:",
-                             reply_markup=kb(
-                                 [[(m, f"model:{m}") for m in MODELS]]))
+                reply("tap to pick model:", reply_markup=kb(
+                    [[(m, f"model:{m}") for m in MODELS]]))
         elif stripped == "/cost":
-            self.tg.send(chat_id, self._cost_text())
+            reply(self._cost_text())
         elif stripped.startswith("/get "):
             arg = stripped[5:].strip()
             path = os.path.expanduser(arg)
             if not os.path.isabs(path):
                 path = os.path.join(chat["cwd"], path)
             if is_sensitive(path):
-                self.tg.send(chat_id,
-                             "refused: that path looks like credential material, "
-                             "and an upload to Telegram cannot be recalled. "
-                             "Read it over /sh if you really mean to.")
+                reply("refused: that path looks like credential material, "
+                      "and an upload to Telegram cannot be recalled. "
+                      "Read it over /sh if you really mean to.")
             else:
                 threading.Thread(target=self._send_file,
-                                 args=(chat_id, path), daemon=True).start()
+                                 args=(chat_id, path, thread_id),
+                                 daemon=True).start()
         elif stripped.startswith("/sh "):
             threading.Thread(target=self._run_sh,
-                             args=(chat_id, chat["cwd"], stripped[4:]),
+                             args=(chat_id, chat["cwd"], stripped[4:],
+                                   thread_id),
                              daemon=True).start()
         elif stripped.startswith("/log"):
             arg = stripped.split(None, 1)[1] if " " in stripped else "30"
-            n = int(arg) if arg.isdigit() else 30
+            n = min(max(int(arg), 1), 500) if arg.isdigit() else 30
             try:
-                with open(LOG_PATH) as f:
-                    tail = "".join(f.readlines()[-n:])
+                lines = read_private(LOG_PATH).decode(
+                    "utf-8", errors="replace").splitlines(keepends=True)
+                tail = "".join(lines[-n:])
             except OSError as e:
                 tail = str(e)
             tail = tail.replace(self.cfg["bot_token"], "***TOKEN***")
@@ -1402,45 +1760,45 @@ class Bridge:
             # was in them. Redacted, not refused: a single secret-shaped
             # string in bridge.log would otherwise break /log permanently,
             # and a debugging tool that refuses to work gets removed.
-            self.tg.send(chat_id, redact_secrets(tail) or "(empty)")
+            reply(redact_secrets(tail) or "(empty)")
         elif stripped.startswith("/file"):
             instruction = (stripped.split(None, 1)[1].strip()
                            if " " in stripped else "")
             path = chat.get("pending_file")
             if not path:
-                self.tg.send(chat_id, "no file waiting — send one first.")
+                reply("no file waiting; send one first.")
             elif not instruction:
-                self.tg.send(chat_id,
-                             f"📎 waiting: {path}\nsay what to do with it: "
-                             "/file summarise the tables")
+                reply(f"📎 waiting: {path}\nsay what to do with it: "
+                      "/file summarise the tables")
             else:
                 w.submit(f"{instruction}\n\n(The user attached a file, "
                          f"saved at: {path})")
         elif stripped:
             pos = w.submit(stripped)
             if pos > 1:
-                self.tg.send(chat_id,
-                             f"📥 queued (position {pos}; /stop cancels)")
+                reply(f"📥 queued (position {pos}; /stop cancels)")
         self.save()
 
     def handle_callback(self, cq):
         """Inline-button taps. Caller has already verified the sender."""
         data = cq.get("data") or ""
-        chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id")
+        callback_message = cq.get("message") or {}
+        chat_id = (callback_message.get("chat") or {}).get("id")
         if chat_id is None:
             self.tg.answer_callback(cq["id"])
             return
-        chat = self.chat_state(chat_id)
+        thread_id = message_thread_id(callback_message)
+        chat = self.chat_state(chat_id, thread_id)
         if data == "fwd:run":
             pending = chat.pop("pending_forward", None)
             if pending:
-                self.worker(chat_id).submit(pending)
+                self.worker(chat_id, thread_id).submit(pending)
             self.tg.answer_callback(cq["id"],
                                     "running" if pending else "nothing held")
             self.save()
             return
         if data == "stop":
-            killed, drained = self.worker(chat_id).stop_all()
+            killed, drained = self.worker(chat_id, thread_id).stop_all()
             note = "stopping…" if killed else "nothing running"
             if drained:
                 note += f" (+{drained} queued dropped)"
@@ -1448,18 +1806,18 @@ class Bridge:
         elif data.startswith("repo:"):
             self.tg.answer_callback(cq["id"])
             path = os.path.expanduser(f"~/dev/{data[5:]}")
-            self._switch_dir(chat_id, chat, path)
+            self._switch_dir(chat_id, chat, path, thread_id)
         elif data.startswith("model:"):
             self.tg.answer_callback(cq["id"])
-            self._set_model(chat_id, chat, data[6:])
+            self._set_model(chat_id, chat, data[6:], thread_id)
         elif data.startswith("engine:"):
             self.tg.answer_callback(cq["id"])
-            self._set_engine(chat_id, chat, data[7:])
+            self._set_engine(chat_id, chat, data[7:], thread_id)
         else:
             self.tg.answer_callback(cq["id"])
         self.save()
 
-    def _set_engine(self, chat_id, chat, name):
+    def _set_engine(self, chat_id, chat, name, thread_id=None):
         with self.state_lock:
             if chat.get("engine", "claude") != name:
                 advance_context(chat)
@@ -1474,9 +1832,9 @@ class Bridge:
                      "repo, but filesystem reads may be broader. It ignores "
                      "custom user configuration unless enabled in "
                      "config.json.")
-        self.tg.send(chat_id, note)
+        self.tg.send(chat_id, note, message_thread_id=thread_id)
 
-    def _switch_dir(self, chat_id, chat, path):
+    def _switch_dir(self, chat_id, chat, path, thread_id=None):
         if os.path.isdir(path):
             with self.state_lock:
                 advance_context(chat)
@@ -1488,11 +1846,12 @@ class Bridge:
             note = f"📁 cwd -> {path} (fresh session)"
             if g:
                 note += f"\n🌿 {g}"
-            self.tg.send(chat_id, note)
+            self.tg.send(chat_id, note, message_thread_id=thread_id)
         else:
-            self.tg.send(chat_id, f"❌ not a directory: {path}")
+            self.tg.send(chat_id, f"❌ not a directory: {path}",
+                         message_thread_id=thread_id)
 
-    def _set_model(self, chat_id, chat, arg):
+    def _set_model(self, chat_id, chat, arg, thread_id=None):
         with self.state_lock:
             advance_context(chat)
             if arg in ("off", "default"):
@@ -1500,9 +1859,11 @@ class Bridge:
             else:
                 chat["model"] = arg
         if arg in ("off", "default"):
-            self.tg.send(chat_id, "🧠 model: default")
+            self.tg.send(chat_id, "🧠 model: default",
+                         message_thread_id=thread_id)
         else:
-            self.tg.send(chat_id, f"🧠 model: {arg} (applies to next run)")
+            self.tg.send(chat_id, f"🧠 model: {arg} (applies to next run)",
+                         message_thread_id=thread_id)
 
     def _status_text(self, chat, w):
         up = int(time.time() - self.started)
@@ -1545,21 +1906,30 @@ class Bridge:
         return "\n".join(lines)
 
     def _handle_file(self, chat_id, msg, w):
+        thread_id = message_thread_id(msg)
+        name_hint = None
         try:
             if msg.get("document"):
-                file_id = msg["document"]["file_id"]
+                media = msg["document"]
+                file_id = media["file_id"]
+                name_hint = media.get("file_name")
             elif msg.get("photo"):     # list of sizes, last is largest
                 file_id = msg["photo"][-1]["file_id"]
+                name_hint = "photo.jpg"
             elif msg.get("voice"):
                 file_id = msg["voice"]["file_id"]
+                name_hint = "voice.ogg"
             else:
-                file_id = msg["audio"]["file_id"]
-            path = self.tg.download(file_id, INBOX_DIR)
+                media = msg["audio"]
+                file_id = media["file_id"]
+                name_hint = media.get("file_name") or "audio.bin"
+            path = self.tg.download(file_id, INBOX_DIR, name_hint=name_hint)
         except Exception as e:
-            self.tg.send(chat_id, f"⚠️ file download failed: {e}")
+            self.tg.send(chat_id, f"⚠️ file download failed: {e}",
+                         message_thread_id=thread_id)
             return
         caption = (msg.get("caption") or "").strip()
-        chat = self.chat_state(chat_id)
+        chat = self.chat_state(chat_id, thread_id)
         chat["pending_file"] = path
         forwarded = is_forwarded(msg)
         log(f"file received -> {path} (forwarded={forwarded}, "
@@ -1575,41 +1945,49 @@ class Bridge:
                 f"📎 saved (forwarded): {path}\n\nIts caption was written by "
                 "whoever posted it, so I did not run it as a prompt. Send "
                 "/file <what to do> to act on it."
-                + (f"\n\nCaption was: {caption[:300]}" if caption else ""))
+                + (f"\n\nCaption was: {caption[:300]}" if caption else ""),
+                message_thread_id=thread_id)
         elif caption:
             w.submit(f"{caption}\n\n(The user attached a file, saved at: "
                      f"{path})")
         else:
             self.tg.send(chat_id,
                          f"📎 saved: {path}\nReply with what to do with "
-                         "it, or send /file <what to do>.")
+                         "it, or send /file <what to do>.",
+                         message_thread_id=thread_id)
         self.save()
 
-    def _send_file(self, chat_id, path):
-        if not os.path.isfile(path):
-            self.tg.send(chat_id, f"❌ not a file: {path}")
+    def _send_file(self, chat_id, path, thread_id=None):
+        resolved = os.path.realpath(path)
+        if not os.path.isfile(resolved):
+            self.tg.send(chat_id, f"❌ not a file: {path}",
+                         message_thread_id=thread_id)
             return
         # Checked here, not only in the /get branch, because this is also the
         # auto-attach path for any agent result over the inline size limit.
         # An agent that has been steered by hostile text in something it read
         # reaches Telegram through here without passing /get at all.
-        if is_sensitive(path):
-            log(f"refused to send sensitive path: {path}")
+        if is_sensitive(resolved):
+            log(f"refused to send sensitive path: {resolved}")
             self.tg.send(chat_id,
                          "refused: that file looks like credential material, "
-                         "and an upload to Telegram cannot be recalled.")
+                         "and an upload to Telegram cannot be recalled.",
+                         message_thread_id=thread_id)
             return
-        size = os.path.getsize(path)
-        if size > 50 * 1024 * 1024:
+        size = os.path.getsize(resolved)
+        if size > MAX_UPLOAD:
             self.tg.send(chat_id,
-                         f"❌ too big for Telegram ({size >> 20}MB > 50MB)")
+                         f"❌ too big for Telegram ({size >> 20}MB > 50MB)",
+                         message_thread_id=thread_id)
             return
         try:
-            self.tg.send_document(chat_id, path)
+            self.tg.send_document(
+                chat_id, resolved, message_thread_id=thread_id)
         except Exception as e:
-            self.tg.send(chat_id, f"⚠️ send failed: {e}")
+            self.tg.send(chat_id, f"⚠️ send failed: {e}",
+                         message_thread_id=thread_id)
 
-    def _run_sh(self, chat_id, cwd, cmdline):
+    def _run_sh(self, chat_id, cwd, cmdline, thread_id=None):
         log(f"sh: {cmdline}")
         try:
             # shell=True is the feature here (/sh is a remote shell for the
@@ -1620,9 +1998,11 @@ class Bridge:
             # /sh is human-driven, not agent-reachable, so this is not the
             # injection path — but `cat` on the wrong file leaks just as
             # permanently. Redact, so the rest of the output still arrives.
-            self.tg.send(chat_id, redact_secrets(out[:8000]))
+            self.tg.send(chat_id, redact_secrets(out[:8000]),
+                         message_thread_id=thread_id)
         except subprocess.TimeoutExpired:
-            self.tg.send(chat_id, "⏱ shell command timed out (300s)")
+            self.tg.send(chat_id, "⏱ shell command timed out (300s)",
+                         message_thread_id=thread_id)
 
     # ------------------------------------------------------------ main loop
 
@@ -1635,7 +2015,7 @@ class Bridge:
     def run(self):
         offset = self.state.get("offset", 0)
         allowed = set(self.cfg["allowed_user_ids"])
-        log(f"bridge v5 up; allowed users: "
+        log(f"bridge v6 up; allowed users: "
             f"{sorted(allowed) or 'NONE (setup mode)'}")
         while True:
             for upd in self.tg.get_updates(offset):
@@ -1679,10 +2059,12 @@ class Bridge:
             # setup mode: reveal sender's id so it can be whitelisted
             log(f"SETUP: message from user id {uid} "
                 f"(@{user.get('username')}, {user.get('first_name')})")
-            self.tg.send(chat_id,
-                         f"Setup mode. Your Telegram user id is {uid}.\n"
-                         f"Add it to allowed_user_ids in config.json and "
-                         f"restart the bridge.")
+            self.tg.send(
+                chat_id,
+                f"Setup mode. Your Telegram user id is {uid}.\n"
+                f"Add it to allowed_user_ids in config.json and "
+                f"restart the bridge.",
+                message_thread_id=message_thread_id(msg))
             return
         if uid not in allowed:
             log(f"DENIED user {uid} ({user.get('username')}): "
@@ -1692,7 +2074,8 @@ class Bridge:
             self.handle(chat_id, msg)
         except Exception as e:
             log(f"handle error: {e!r}")
-            self.tg.send(chat_id, f"⚠️ bridge error: {e}")
+            self.tg.send(chat_id, f"⚠️ bridge error: {e}",
+                         message_thread_id=message_thread_id(msg))
 
 
 # ---------------------------------------------------------------- main
@@ -1700,23 +2083,44 @@ class Bridge:
 def check(cfg):
     ok = True
     if not cfg.get("bot_token") or "PASTE" in cfg.get("bot_token", ""):
-        print("✗ bot_token not set in config.json"); ok = False
+        print("✗ bot_token not set in config.json")
+        ok = False
     else:
         print("✓ bot_token present")
-    if os.path.isfile(cfg["claude_bin"]) and os.access(cfg["claude_bin"],
-                                                       os.X_OK):
-        print(f"✓ claude binary: {cfg['claude_bin']}")
-    else:
-        print(f"✗ claude binary missing: {cfg['claude_bin']}"); ok = False
-    if os.path.isfile(cfg["codex_bin"]) and os.access(cfg["codex_bin"],
-                                                      os.X_OK):
-        print(f"✓ codex binary: {cfg['codex_bin']}")
-    else:
-        print(f"✗ codex binary missing: {cfg['codex_bin']}"); ok = False
+
+    cli_checks = (
+        ("claude", cfg["claude_bin"], ["--help"],
+         ("--strict-mcp-config", "--setting-sources", "--no-chrome")),
+        ("codex", cfg["codex_bin"], ["exec", "--help"],
+         ("--ignore-user-config", "--ignore-rules", "--sandbox", "--json")),
+        ("kimi", cfg["kimi_bin"], ["--help"],
+         ("--prompt", "--output-format")),
+    )
+    for label, binary, arguments, required in cli_checks:
+        if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+            print(f"✗ {label} binary missing: {binary}")
+            ok = False
+            continue
+        try:
+            proc = subprocess.run(
+                [binary, *arguments], capture_output=True, text=True,
+                timeout=15, check=False)
+            help_text = proc.stdout + proc.stderr
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"✗ {label} capability check failed: {exc}")
+            ok = False
+            continue
+        missing = [flag for flag in required if flag not in help_text]
+        if proc.returncode != 0 or missing:
+            print(f"✗ {label} is missing required flags: {missing}")
+            ok = False
+        else:
+            print(f"✓ {label} binary and automation flags: {binary}")
     if os.path.isdir(cfg["default_cwd"]):
         print(f"✓ default cwd: {cfg['default_cwd']}")
     else:
-        print(f"✗ default cwd missing: {cfg['default_cwd']}"); ok = False
+        print(f"✗ default cwd missing: {cfg['default_cwd']}")
+        ok = False
     if cfg["allowed_user_ids"]:
         print(f"✓ allowed users: {cfg['allowed_user_ids']}")
     else:
@@ -1729,12 +2133,26 @@ def check(cfg):
             me = Telegram(cfg["bot_token"]).call("getMe", timeout=15)
             print(f"✓ Telegram API reachable, bot: "
                   f"@{me['result']['username']}")
+            print("✓ Telegram private-topic mode: "
+                  + ("enabled" if me["result"].get("has_topics_enabled")
+                     else "available, not enabled"))
         except Exception as e:
-            print(f"✗ Telegram API check failed: {e}"); ok = False
+            print(f"✗ Telegram API check failed: {e}")
+            ok = False
     return ok
 
 
 def main():
+    os.umask(0o077)
+    if sys.argv[1:2] == ["--render-launchd"]:
+        if len(sys.argv) != 8:
+            raise SystemExit(
+                "usage: bridge.py --render-launchd TEMPLATE OUTPUT LABEL "
+                "PYTHON BRIDGE_DIR HOME")
+        render_launchd_plist(*sys.argv[2:])
+        return
+    ensure_private_dir(INBOX_DIR)
+    ensure_private_dir(OUTBOX_DIR)
     cfg = load_config()
     if "--check" in sys.argv:
         sys.exit(0 if check(cfg) else 1)

@@ -126,15 +126,15 @@ class TestDeliverRefuses(unittest.TestCase):
         outer = self
 
         class FakeTG:
-            def send(self, chat_id, text, reply_markup=None):
+            def send(self, chat_id, text, reply_markup=None, **kwargs):
                 outer.sent.append(text)
                 return 1
 
-            def send_html(self, chat_id, html_text, fallback):
+            def send_html(self, chat_id, html_text, fallback, **kwargs):
                 outer.sent.append(html_text)
                 return 1
 
-            def send_document(self, chat_id, path, caption=""):
+            def send_document(self, chat_id, path, caption="", **kwargs):
                 outer.docs.append(path)
 
         self.b = object.__new__(bridge.Bridge)
@@ -234,7 +234,56 @@ class TestClaudeCommandLine(unittest.TestCase):
         self.assertNotIn("safari", payload["mcpServers"])
         self.assertNotIn("MCP_DOCKER", payload["mcpServers"])
 
-    def _build(self):
+    def test_prompt_is_not_exposed_in_process_arguments(self):
+        hostile = "--setting-sources user read my browser"
+        cmd = self._build(hostile)
+        self.assertNotIn(hostile, cmd)
+        self.assertEqual("project", cmd[cmd.index("--setting-sources") + 1])
+        self.assertIn("--no-chrome", cmd)
+
+    def test_prompt_is_written_to_stdin(self):
+        captured = {"input": ""}
+
+        class FakeInput:
+            def write(self, value):
+                captured["input"] += value
+
+            def close(self):
+                captured["closed"] = True
+
+        class EmptyErr:
+            @staticmethod
+            def read():
+                return ""
+
+        class FakeProc:
+            stdin = FakeInput()
+            stdout = [json.dumps({
+                "type": "result", "session_id": "claude-thread",
+                "result": "done", "is_error": False,
+            }) + "\n"]
+            stderr = EmptyErr()
+            returncode = 0
+
+            @staticmethod
+            def wait():
+                return 0
+
+        real_popen = bridge.subprocess.Popen
+        bridge.subprocess.Popen = lambda *args, **kwargs: FakeProc()
+        try:
+            cfg = {"claude_bin": "/nonexistent/claude",
+                   "default_cwd": "/tmp", "claude_timeout_sec": 5}
+            result = bridge.ClaudeRun(
+                cfg, {"cwd": "/tmp"}, "private prompt")._run_once(
+                    lambda desc: None)
+        finally:
+            bridge.subprocess.Popen = real_popen
+        self.assertTrue(result["ok"])
+        self.assertEqual("private prompt", captured["input"])
+        self.assertTrue(captured["closed"])
+
+    def _build(self, prompt="hello"):
         """Reproduce _run_once's argv without spawning anything."""
         captured = {}
         real_popen = bridge.subprocess.Popen
@@ -248,7 +297,7 @@ class TestClaudeCommandLine(unittest.TestCase):
 
         cfg = {"claude_bin": "/nonexistent/claude", "default_cwd": "/tmp",
                "claude_timeout_sec": 5}
-        run = bridge.ClaudeRun(cfg, {"cwd": "/tmp"}, "hello")
+        run = bridge.ClaudeRun(cfg, {"cwd": "/tmp"}, prompt)
         bridge.subprocess.Popen = fake_popen
         try:
             run._run_once(lambda d: None)
@@ -268,6 +317,7 @@ class TestCodexCommandLine(unittest.TestCase):
             "codex_timeout_sec": 5,
             "codex_sandbox": "workspace-write",
             "codex_ignore_user_config": True,
+            "codex_ignore_rules": True,
         }
 
     def test_new_run_is_sandboxed_and_drops_user_integrations(self):
@@ -276,6 +326,7 @@ class TestCodexCommandLine(unittest.TestCase):
         self.assertIn("--sandbox", cmd)
         self.assertEqual("workspace-write", cmd[cmd.index("--sandbox") + 1])
         self.assertIn("--ignore-user-config", cmd)
+        self.assertIn("--ignore-rules", cmd)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
 
     def test_resume_uses_codex_session_not_claude_session(self):
@@ -287,6 +338,7 @@ class TestCodexCommandLine(unittest.TestCase):
         self.assertIn("codex-id", cmd)
         self.assertNotIn("claude-id", cmd)
         self.assertIn("--ignore-user-config", cmd)
+        self.assertIn("--ignore-rules", cmd)
         self.assertIn("-c", cmd)
         self.assertIn('sandbox_mode="workspace-write"', cmd)
 
@@ -302,9 +354,11 @@ class TestCodexCommandLine(unittest.TestCase):
         run = bridge.CodexRun(self.cfg, {"cwd": "/tmp/repo"}, hostile)
         cmd = run._command("/tmp/repo")
 
-        # The prompt is positional, after the terminator, never parsed.
+        # The positional value is stdin's "-" marker. The prompt itself is
+        # absent from argv, so it cannot be parsed or exposed by process tools.
         self.assertIn("--", cmd)
-        self.assertEqual(hostile, cmd[-1])
+        self.assertNotIn(hostile, cmd)
+        self.assertEqual("-", cmd[-1])
         self.assertGreater(cmd.index("--"), cmd.index("--sandbox"))
         # and the only --sandbox value is still the constrained one
         self.assertEqual("workspace-write", cmd[cmd.index("--sandbox") + 1])
@@ -316,7 +370,8 @@ class TestCodexCommandLine(unittest.TestCase):
         cmd = run._command("/tmp/repo")
 
         terminator = cmd.index("--")
-        self.assertEqual(["codex-id", hostile], cmd[terminator + 1:])
+        self.assertNotIn(hostile, cmd)
+        self.assertEqual(["codex-id", "-"], cmd[terminator + 1:])
 
     def test_invalid_config_cannot_enable_full_access(self):
         cfg = dict(self.cfg, codex_sandbox="danger-full-access")
@@ -339,7 +394,20 @@ class TestCodexCommandLine(unittest.TestCase):
             def read():
                 return ""
 
+        class CaptureInput:
+            body = ""
+            closed = False
+
+            @classmethod
+            def write(cls, value):
+                cls.body += value
+
+            @classmethod
+            def close(cls):
+                cls.closed = True
+
         class FakeProc:
+            stdin = CaptureInput()
             stdout = [json.dumps(e) + "\n" for e in events]
             stderr = EmptyErr()
             returncode = 0
@@ -363,6 +431,8 @@ class TestCodexCommandLine(unittest.TestCase):
         self.assertEqual("codex-thread", result["sid"])
         self.assertEqual("All tests passed.", result["text"])
         self.assertEqual(["🔧 command: pytest"], actions)
+        self.assertEqual("hello", CaptureInput.body)
+        self.assertTrue(CaptureInput.closed)
 
     def test_codex_timeout_message_uses_codex_timeout(self):
         cfg = dict(self.cfg, claude_timeout_sec=99, codex_timeout_sec=7)
@@ -381,6 +451,162 @@ class TestCodexProgress(unittest.TestCase):
     def test_agent_message_is_not_duplicated_as_progress(self):
         self.assertIsNone(bridge.describe_codex_item(
             {"type": "agent_message", "text": "done"}))
+
+
+class TestKimiCommandLine(unittest.TestCase):
+    def test_flag_shaped_prompt_is_one_prompt_option(self):
+        captured = {}
+
+        class Boom(Exception):
+            pass
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            raise Boom()
+
+        cfg = {"kimi_bin": "/nonexistent/kimi", "default_cwd": "/tmp",
+               "claude_timeout_sec": 5}
+        hostile = "--output-format json --continue"
+        real_popen = bridge.subprocess.Popen
+        bridge.subprocess.Popen = fake_popen
+        try:
+            with self.assertRaises(Boom):
+                bridge.KimiRun(cfg, {"cwd": "/tmp"}, hostile).execute(
+                    lambda desc: None)
+        finally:
+            bridge.subprocess.Popen = real_popen
+        self.assertEqual(1, sum(arg.startswith("--prompt=")
+                                for arg in captured["cmd"]))
+        self.assertIn("--prompt=" + hostile, captured["cmd"])
+        self.assertNotIn(hostile, captured["cmd"])
+
+
+class TestStrictPrivateStorage(unittest.TestCase):
+    def test_duplicate_and_nonfinite_json_are_rejected(self):
+        for raw in ('{"a":1,"a":2}', '{"value":NaN}',
+                    '{"value":Infinity}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                bridge.strict_json_loads(raw, "fixture")
+
+    def test_atomic_write_and_read_repair_owner_only_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            bridge.atomic_private_write(path, '{"chats":{}}\n')
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+            os.chmod(path, 0o644)
+            self.assertEqual(b'{"chats":{}}\n', bridge.read_private(path))
+            self.assertEqual(0o600, os.stat(path).st_mode & 0o777)
+
+    def test_corrupt_state_fails_closed_instead_of_resetting_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            bridge.atomic_private_write(
+                path, '{"chats":{},"offset":9,"offset":0}\n')
+            original = bridge.STATE_PATH
+            bridge.STATE_PATH = path
+            try:
+                with self.assertRaises(ValueError):
+                    bridge.Bridge._load_state()
+            finally:
+                bridge.STATE_PATH = original
+
+
+class TestLaunchdRenderer(unittest.TestCase):
+    def test_renderer_replaces_the_argument_array_instead_of_appending(self):
+        template = os.path.join(os.path.dirname(__file__),
+                                "launchd.plist.template")
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "bridge.plist")
+            open(output, "wb").close()
+            bridge.render_launchd_plist(
+                template, output, "com.example.bridge",
+                "/opt/python 3/bin/python3", "/Users/example/Bridge App",
+                "/Users/example")
+            mode = os.stat(output).st_mode & 0o777
+            with open(output, "rb") as handle:
+                payload = bridge.plistlib.load(handle)
+        self.assertEqual([
+            "/usr/bin/caffeinate", "-si", "/opt/python 3/bin/python3",
+            "/Users/example/Bridge App/bridge.py",
+        ], payload["ProgramArguments"])
+        self.assertEqual("/Users/example/Bridge App",
+                         payload["WorkingDirectory"])
+        self.assertEqual(0o77, payload["Umask"])
+        self.assertEqual(0o600, mode)
+
+
+class TestPrivateTopics(unittest.TestCase):
+    def test_thread_identifier_validation_and_conversation_keys(self):
+        self.assertEqual(99, bridge.message_thread_id(
+            {"message_thread_id": 99}))
+        for invalid in (None, True, 0, -1, "99"):
+            self.assertIsNone(bridge.message_thread_id(
+                {"message_thread_id": invalid}))
+        self.assertEqual("7", bridge.conversation_key(7))
+        self.assertEqual("7:99", bridge.conversation_key(7, 99))
+
+    def test_topics_keep_independent_state(self):
+        instance = object.__new__(bridge.Bridge)
+        instance.cfg = {"default_cwd": "/tmp"}
+        instance.state_lock = bridge.threading.RLock()
+        instance.state = {"chats": {}}
+        first = instance.chat_state(7, 99)
+        first["cwd"] = "/repo/one"
+        second = instance.chat_state(7, 100)
+        base = instance.chat_state(7)
+        self.assertEqual("/repo/one", first["cwd"])
+        self.assertEqual("/tmp", second["cwd"])
+        self.assertEqual("/tmp", base["cwd"])
+        self.assertEqual({"7", "7:99", "7:100"},
+                         set(instance.state["chats"]))
+
+    def test_send_routes_message_to_topic(self):
+        telegram = bridge.Telegram("synthetic-token")
+        calls = []
+
+        def fake_call(method, params=None, **kwargs):
+            calls.append((method, params))
+            return {"ok": True, "result": {"message_id": 8}}
+
+        telegram.call = fake_call
+        self.assertEqual(8, telegram.send(7, "hello", message_thread_id=99))
+        self.assertEqual("sendMessage", calls[0][0])
+        self.assertEqual(99, calls[0][1]["message_thread_id"])
+
+
+class TestBoundedTelegramProtocol(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, body, declared=None):
+            self.body = body
+            self.headers = ({} if declared is None
+                            else {"Content-Length": declared})
+
+        def read(self, limit=-1):
+            return self.body if limit < 0 else self.body[:limit]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def test_declared_and_actual_oversize_bodies_are_rejected(self):
+        with self.assertRaises(ValueError):
+            bridge.read_bounded(self.FakeResponse(b"{}", "100"), 10,
+                                "fixture")
+        with self.assertRaises(ValueError):
+            bridge.read_bounded(self.FakeResponse(b"x" * 11), 10,
+                                "fixture")
+
+    def test_success_status_is_required_even_on_http_200(self):
+        real_urlopen = bridge.urllib.request.urlopen
+        bridge.urllib.request.urlopen = lambda *args, **kwargs: \
+            self.FakeResponse(b'{"ok":false,"description":"denied"}')
+        try:
+            with self.assertRaisesRegex(bridge.TelegramError, "denied"):
+                bridge.Telegram("synthetic-token").call("getMe")
+        finally:
+            bridge.urllib.request.urlopen = real_urlopen
 
 
 class TestQueuedJobContext(unittest.TestCase):
@@ -481,11 +707,11 @@ class TestForwardedFileIsNotAutoSubmitted(unittest.TestCase):
                 return 1
 
         class FakeTG:
-            def send(self, chat_id, text, reply_markup=None):
+            def send(self, chat_id, text, reply_markup=None, **kwargs):
                 outer.sent.append(text)
                 return 1
 
-            def download(self, file_id, dest):
+            def download(self, file_id, dest, name_hint=None):
                 fd, p = tempfile.mkstemp(suffix=".pdf")
                 os.close(fd)
                 return p
@@ -538,7 +764,7 @@ class TestForwardedTextIsNotDispatched(unittest.TestCase):
         outer = self
 
         class FakeTG:
-            def send(self, chat_id, text, reply_markup=None):
+            def send(self, chat_id, text, reply_markup=None, **kwargs):
                 outer.sent.append(text)
                 return 1
 
@@ -556,8 +782,9 @@ class TestForwardedTextIsNotDispatched(unittest.TestCase):
         self.b.state = {"chats": {}}
         self.b.cfg = {"default_cwd": "/tmp", "bot_token": "unused"}
         self.b.save = lambda: None
-        self.b.worker = lambda cid: FakeWorker()
-        self.b._run_sh = lambda cid, cwd, cmd: outer.shell.append(cmd)
+        self.b.worker = lambda cid, thread_id=None: FakeWorker()
+        self.b._run_sh = lambda cid, cwd, cmd, thread_id=None: \
+            outer.shell.append(cmd)
 
     def _fwd(self, text):
         return {"text": text, "forward_origin": {"type": "channel"}}

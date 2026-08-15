@@ -8,23 +8,29 @@
   <array>
     <string>/usr/bin/caffeinate</string>
     <string>-si</string>
-    <string>/opt/homebrew/bin/python3</string>
-    <string>__DIR__/bridge.py</string>
+    <string>__PYTHON__</string>
+    <string>__BRIDGE__/bridge.py</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>__DIR__</string>
+  <string>__BRIDGE__</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>__DIR__/launchd.out.log</string>
+  <string>__BRIDGE__/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>__DIR__/launchd.err.log</string>
+  <string>__BRIDGE__/launchd.err.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>__PATH__</string>
     <key>HOME</key>
     <string>__HOME__</string>
   </dict>

@@ -1,0 +1,35 @@
+title = "claude-telegram-bridge Gitleaks policy"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Audited historical commits that introduced synthetic scanner fixtures"
+commits = [
+  "3fdff4df461d3b28c1f1f07d84c0d06362b92607",
+  "4084058b7fc9c7a9fb7e52b810603ba886f91cab",
+]
+
+[[allowlists]]
+description = "The outbound scanner must contain the OpenSSH marker it detects"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)bridge\.py$''']
+regexTarget = "line"
+regexes = ['''re\.compile\(r"-----BEGIN OPENSSH PRIVATE KEY-----"\)''']
+
+[[allowlists]]
+description = "Synthetic private-key fixture used to prove outbound blocking"
+targetRules = ["private-key"]
+condition = "AND"
+paths = ['''(^|/)test_bridge\.py$''']
+regexTarget = "line"
+regexes = ['''-----BEGIN (RSA|OPENSSH) PRIVATE KEY-----''']
+
+[[allowlists]]
+description = "Synthetic assigned-key fixture used to prove outbound blocking"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)test_bridge\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*'ANTHROPIC_API_KEY="[A-Za-z0-9]{32,}"',$''']
