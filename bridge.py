@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Telegram -> Claude Code / Codex / Kimi bridge v6.
+"""Telegram -> Claude / Codex / Kimi / Cursor / Grok bridge v7.
 
-v4: model picker includes Fable 5 (claude-fable-5); second engine — Kimi
+v4: model picker includes Fable 5 (claude-fable-5); second engine, Kimi
 Code (/engine, per-directory -c continuity, errors surfaced with a renew
 hint); /attach continues the latest Claude session in the cwd (terminal
 handoff); elapsed-time ticker keeps the progress clock moving during
@@ -18,9 +18,15 @@ prompts reach Claude and Codex over stdin; current CLI isolation flags are
 verified before launch; JSON, HTTP bodies and file transfers are bounded;
 and every local credential-bearing artifact is written atomically as 0600.
 
+v7: one Telegram poller remains the only getUpdates owner. A mode-0600
+Unix socket and `ll-hub` CLI let terminal, Cursor, Codex, and Grok share
+that same worker. Cursor (`agent -p`) and Grok (`grok --single`) are
+optional engines. setMyCommands and a webhook check keep Telegram and
+Nicegram on the same bot. Mission Control reads health.json only.
+
 Runs on this Mac. Polls Telegram (getUpdates long polling, outbound HTTPS
 only, works behind NAT). Messages from the whitelisted user are fed to
-headless Claude Code (`claude -p`); replies come back to the same chat.
+the selected engine; replies come back to the same chat.
 
 v3 over v2:
 - process-group kill for /stop (children die too), SIGTERM -> SIGKILL
@@ -43,6 +49,7 @@ import os
 import plistlib
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import socket
@@ -56,6 +63,8 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+
+import hub_local
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -502,9 +511,17 @@ def load_config():
     cfg.setdefault("kimi_bin", os.path.expanduser("~/.kimi-code/bin/kimi"))
     cfg.setdefault("codex_bin",
                    "/Applications/ChatGPT.app/Contents/Resources/codex")
+    cfg.setdefault("cursor_bin", os.path.expanduser("~/.local/bin/agent"))
+    cfg.setdefault("grok_bin", os.path.expanduser("~/.local/bin/grok"))
     cfg.setdefault("claude_timeout_sec", 3600)
     cfg.setdefault("codex_timeout_sec", cfg["claude_timeout_sec"])
+    cfg.setdefault("cursor_timeout_sec", cfg["claude_timeout_sec"])
+    cfg.setdefault("grok_timeout_sec", cfg["claude_timeout_sec"])
     cfg.setdefault("codex_sandbox", "workspace-write")
+    # Headless Cursor from Telegram is the same high-authority surface as
+    # Claude bypassPermissions. --force avoids a hung approval prompt on
+    # the phone. --approve-mcps stays off.
+    cfg.setdefault("cursor_force", True)
     # A Telegram message is a higher-risk entry point than an interactive
     # desktop task. Do not load custom global config (including custom MCP
     # servers) unless the owner consciously opts in via config.json.
@@ -527,17 +544,24 @@ def load_config():
                    or value <= 0 for value in allowed)
             or len(set(allowed)) != len(allowed)):
         raise ValueError("allowed_user_ids must be unique positive integers")
-    for name in ("default_cwd", "claude_bin", "kimi_bin", "codex_bin"):
+    for name in ("default_cwd", "claude_bin", "kimi_bin", "codex_bin",
+                 "cursor_bin", "grok_bin"):
         if not isinstance(cfg[name], str) or not cfg[name].strip():
             raise ValueError(f"{name} must be a nonempty path string")
         cfg[name] = os.path.realpath(os.path.expanduser(cfg[name]))
-    for name in ("claude_timeout_sec", "codex_timeout_sec"):
+    for name, program in (("cursor_bin", "agent"), ("grok_bin", "grok")):
+        if not os.path.isfile(cfg[name]):
+            found = shutil.which(program)
+            if found:
+                cfg[name] = os.path.realpath(found)
+    for name in ("claude_timeout_sec", "codex_timeout_sec",
+                 "cursor_timeout_sec", "grok_timeout_sec"):
         value = cfg[name]
         if (isinstance(value, bool) or not isinstance(value, int)
                 or not 30 <= value <= 86400):
             raise ValueError(f"{name} must be an integer from 30 to 86400")
     for name in ("codex_ignore_user_config", "codex_ignore_rules",
-                 "force_ipv4"):
+                 "force_ipv4", "cursor_force"):
         if not isinstance(cfg[name], bool):
             raise ValueError(f"{name} must be true or false")
     if cfg["codex_sandbox"] not in ("read-only", "workspace-write"):
@@ -683,13 +707,21 @@ class Telegram:
                 log("FATAL: Telegram rejected the token (401) — revoked? exiting")
                 os._exit(1)
             if "409" in text or "Conflict" in text:
-                log("FATAL: 409 Conflict — another poller holds this bot token; "
+                log("FATAL: 409 Conflict: another poller holds this bot token; "
                     "exiting so only one survives")
                 os._exit(1)
             backoff = min(5 * 2 ** (self._fails - 1), 300)
             log(f"getUpdates error ({self._fails}, retry in {backoff}s): {e}")
             time.sleep(backoff)
             return []
+
+    def webhook_info(self):
+        return self.call("getWebhookInfo", timeout=15)
+
+    def set_my_commands(self, commands):
+        return self.call("setMyCommands",
+                         {"commands": json.dumps(commands, allow_nan=False)},
+                         timeout=15)
 
     def send(self, chat_id, text, reply_markup=None, message_thread_id=None):
         """Plain-text send (chunked). Returns message_id of first chunk."""
@@ -897,6 +929,8 @@ class EngineRun:
     SIGTERM -> SIGKILL after KILL_GRACE seconds.
     """
 
+    engine_name = "claude"
+
     def __init__(self, cfg, chat, prompt):
         self.cfg = cfg
         self.chat = chat
@@ -933,6 +967,8 @@ class EngineRun:
 
 class ClaudeRun(EngineRun):
     """Streaming headless Claude Code run."""
+
+    engine_name = "claude"
 
     def execute(self, on_event):
         """Run claude; on_event(desc) per action. Returns result dict:
@@ -1060,6 +1096,8 @@ class KimiRun(EngineRun):
     working directory), armed after the first successful run per chat.
     """
 
+    engine_name = "kimi"
+
     def execute(self, on_event):
         cmd = [self.cfg["kimi_bin"], f"--prompt={self.prompt}",
                "--output-format", "text"]
@@ -1139,6 +1177,8 @@ def describe_codex_item(item):
 
 class CodexRun(EngineRun):
     """Streaming, resumable OpenAI Codex non-interactive run."""
+
+    engine_name = "codex"
 
     def execute(self, on_event):
         for _ in range(2):
@@ -1278,7 +1318,222 @@ class CodexRun(EngineRun):
                 "text": f"⚠️ Codex exited {proc.returncode}: {detail[:1500]}"}
 
 
-ENGINES = {"claude": ClaudeRun, "codex": CodexRun, "kimi": KimiRun}
+def describe_cursor_tool(event):
+    """One compact progress line for a Cursor stream-json tool_call."""
+    call = event.get("tool_call") or {}
+    if not isinstance(call, dict) or not call:
+        name = event.get("name") or "tool"
+        return f"⚙️ {name}"
+    kind, body = next(iter(call.items()))
+    label = kind.replace("ToolCall", "").replace("toolCall", "") or "tool"
+    args = (body or {}).get("args") if isinstance(body, dict) else {}
+    detail = ""
+    if isinstance(args, dict):
+        detail = (args.get("path") or args.get("file_path")
+                  or args.get("command") or args.get("query") or "")
+    detail = " ".join(str(detail).split())
+    if len(detail) > 60:
+        detail = detail[:57] + "…"
+    return f"⚙️ {label}: {detail}" if detail else f"⚙️ {label}"
+
+
+class CursorRun(EngineRun):
+    """Headless Cursor agent (`agent -p`, stream-json, workspace-scoped)."""
+
+    engine_name = "cursor"
+
+    def execute(self, on_event):
+        for _ in range(2):
+            outcome = self._run_once(on_event)
+            if outcome is not None:
+                return outcome
+            if self.stop_reason:
+                return {"sid": None, "ok": False, "text": "🛑 stopped."}
+        err = self._stderr or "no output"
+        return {"sid": None, "ok": False,
+                "text": f"⚠️ cursor gave no result: {err[:1500]}"}
+
+    def _command(self, cwd):
+        cmd = [
+            self.cfg["cursor_bin"], "-p",
+            "--output-format", "stream-json",
+            "--trust",
+            "--workspace", cwd,
+        ]
+        if self.cfg.get("cursor_force", True):
+            cmd.append("--force")
+        sid = self.chat.get("cursor_session_id")
+        if sid == CONTINUE:
+            cmd.append("--continue")
+        elif sid:
+            cmd.extend(["--resume", sid])
+        # "--" so a leading-dash prompt cannot become an extra flag.
+        cmd.extend(["--", self.prompt])
+        return cmd
+
+    def _run_once(self, on_event):
+        cwd = self.chat.get("cwd") or self.cfg["default_cwd"]
+        cmd = self._command(cwd)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=cwd, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True)
+        except FileNotFoundError:
+            return {"sid": None, "ok": False,
+                    "text": f"Cursor agent not found at {self.cfg['cursor_bin']}"}
+
+        proc = self.proc
+        self._stderr = ""
+
+        def read_err():
+            try:
+                self._stderr = proc.stderr.read().strip()
+            except Exception:
+                pass
+        threading.Thread(target=read_err, daemon=True).start()
+
+        killer = threading.Timer(
+            self.cfg.get("cursor_timeout_sec",
+                         self.cfg.get("claude_timeout_sec", 3600)),
+            lambda: self.cancel("timeout"))
+        killer.daemon = True
+        killer.start()
+
+        new_sid, result = None, None
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                kind = event.get("type")
+                if kind == "system" and event.get("subtype") == "init":
+                    new_sid = event.get("session_id") or new_sid
+                elif kind == "tool_call" and event.get("subtype") == "started":
+                    on_event(describe_cursor_tool(event))
+                elif kind == "assistant":
+                    for block in (event.get("message") or {}).get("content", []):
+                        if block.get("type") == "text" and block.get("text", "").strip():
+                            snip = " ".join(block["text"].split())
+                            on_event("💬 " + (snip[:57] + "…"
+                                              if len(snip) > 60 else snip))
+                elif kind == "result":
+                    result = event
+                    new_sid = event.get("session_id") or new_sid
+        finally:
+            killer.cancel()
+            proc.wait()
+
+        if self.stop_reason and (result is None or result.get("is_error")):
+            return {"sid": (result or {}).get("session_id") or new_sid,
+                    "ok": False, "text": self._stopped_text()}
+        if result is not None:
+            text = result.get("result") or "(no result text)"
+            if result.get("is_error"):
+                text = "⚠️ Cursor reported an error:\n" + text
+            return {"sid": result.get("session_id") or new_sid,
+                    "ok": not result.get("is_error"), "text": text}
+        if self.chat.get("cursor_session_id"):
+            self.chat["cursor_session_id"] = None
+            return None
+        return {"sid": new_sid, "ok": False,
+                "text": f"⚠️ cursor exited {proc.returncode}: "
+                        f"{(self._stderr or 'no output')[:1500]}"}
+
+
+class GrokRun(EngineRun):
+    """Headless Grok CLI (`grok --single`, one-shot)."""
+
+    engine_name = "grok"
+
+    def _command(self, cwd):
+        cmd = [self.cfg["grok_bin"], "--single", self.prompt,
+               "--cwd", cwd, "--output-format", "plain"]
+        model = self.chat.get("model")
+        if model and model not in ("default", "off"):
+            cmd.extend(["-m", model])
+        return cmd
+
+    def execute(self, on_event):
+        cwd = self.chat.get("cwd") or self.cfg["default_cwd"]
+        cmd = self._command(cwd)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=cwd, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True)
+        except FileNotFoundError:
+            return {"sid": None, "ok": False,
+                    "text": f"Grok CLI not found at {self.cfg['grok_bin']}"}
+
+        proc = self.proc
+        err_buf = []
+        threading.Thread(
+            target=lambda: err_buf.append(proc.stderr.read()),
+            daemon=True).start()
+        killer = threading.Timer(
+            self.cfg.get("grok_timeout_sec",
+                         self.cfg.get("claude_timeout_sec", 3600)),
+            lambda: self.cancel("timeout"))
+        killer.daemon = True
+        killer.start()
+
+        out_lines = []
+        try:
+            for line in proc.stdout:
+                out_lines.append(line)
+                snip = " ".join(line.split())
+                if snip:
+                    on_event("⚡ " + (snip[:57] + "…"
+                                      if len(snip) > 60 else snip))
+        finally:
+            killer.cancel()
+            proc.wait()
+
+        if self.stop_reason:
+            return {"sid": None, "ok": False, "text": self._stopped_text()}
+        out = "".join(out_lines).strip()
+        err = ("".join(err_buf)).strip()
+        if proc.returncode != 0:
+            detail = err or out or "no output"
+            return {"sid": None, "ok": False,
+                    "text": f"⚠️ grok exited {proc.returncode}: "
+                            f"{detail[:1200]}"}
+        return {"sid": None, "ok": True, "text": out or "(empty response)"}
+
+
+ENGINES = {
+    "claude": ClaudeRun,
+    "codex": CodexRun,
+    "kimi": KimiRun,
+    "cursor": CursorRun,
+    "grok": GrokRun,
+}
+
+BOT_COMMANDS = [
+    {"command": "help", "description": "What this hub can do"},
+    {"command": "status", "description": "Engine, repo, queue, uptime"},
+    {"command": "engine", "description": "Pick claude, codex, kimi, cursor, grok"},
+    {"command": "repos", "description": "Switch a ~/dev repository"},
+    {"command": "new", "description": "Start a fresh engine session"},
+    {"command": "attach", "description": "Continue the latest terminal session"},
+    {"command": "stop", "description": "Kill the current run and drain the queue"},
+    {"command": "clients", "description": "Telegram, Nicegram, and ll-hub"},
+    {"command": "cost", "description": "Recent Claude spend"},
+]
+
+
+def webhook_is_clear(info):
+    """A leftover webhook steals getUpdates and the Mac goes silent."""
+    if not isinstance(info, dict):
+        return False
+    result = info.get("result") if "result" in info else info
+    if not isinstance(result, dict):
+        return False
+    url = result.get("url") or ""
+    return url == ""
 
 
 def message_thread_id(message):
@@ -1307,6 +1562,7 @@ def snapshot_job(chat, prompt):
         "generation": chat.get("context_generation", 0),
         "session_id": chat.get("session_id"),
         "codex_session_id": chat.get("codex_session_id"),
+        "cursor_session_id": chat.get("cursor_session_id"),
         "kimi_continue": chat.get("kimi_continue", False),
     }
 
@@ -1323,6 +1579,7 @@ def commit_context_if_current(live_chat, job, context):
         return False
     live_chat["session_id"] = context["session_id"]
     live_chat["codex_session_id"] = context["codex_session_id"]
+    live_chat["cursor_session_id"] = context.get("cursor_session_id")
     if context["kimi_continue"]:
         live_chat["kimi_continue"] = True
     else:
@@ -1338,6 +1595,7 @@ def update_context_from_run(context, chat, engine, result):
     stale ID would be committed to the live chat again.
     """
     field = ("codex_session_id" if engine == "codex"
+             else "cursor_session_id" if engine == "cursor"
              else "session_id" if engine == "claude" else None)
     if field:
         if result.get("sid") is not None:
@@ -1407,6 +1665,7 @@ class Worker(threading.Thread):
         context = self.contexts.setdefault(key, {
             "session_id": job["session_id"],
             "codex_session_id": job["codex_session_id"],
+            "cursor_session_id": job.get("cursor_session_id"),
             "kimi_continue": job["kimi_continue"],
         })
         chat = {
@@ -1493,22 +1752,25 @@ class Worker(threading.Thread):
 
 # ---------------------------------------------------------------- handlers
 
-HELP = """Claude / Codex / Kimi bridge on the host Mac (v6).
+HELP = """LiquiLens agent hub on the host Mac (v7).
 
-Just type anything -> Claude Code runs it in the current repo; each tool
-call streams into a live progress message with a 🛑 stop button.
-Send a photo/document/voice note with a caption -> saved to this Mac,
-caption becomes the prompt (Claude gets the file path). FORWARDED files
-and forwarded text are held instead: their words are someone else's, so
-they run only on /file <instruction> or a tap of the run button.
+One Telegram poller. Telegram and Nicegram show the same bot. Terminal,
+Cursor, Codex, and Grok attach with `ll-hub` instead of a second poller.
+
+Just type anything and the selected engine runs it in the current repo.
+Each tool call streams into a live progress message with a 🛑 stop button.
+Send a photo/document/voice note with a caption: saved to this Mac,
+caption becomes the prompt. FORWARDED files and forwarded text are held:
+their words are someone else's, so they run only on /file <instruction>
+or a tap of the run button.
 
 Commands (answer instantly, even while the engine is working):
 /stop          kill the current run + clear the queue
 /status        cwd, git branch, engine, session, model, queue, uptime
+/clients       Telegram, Nicegram, and the local ll-hub CLI
 /new           fresh session
-/attach        continue the latest Claude session in this cwd —
-               pick up exactly where the terminal left off
-/engine        tap to pick claude 🤖, codex 🧭, or kimi 🌙
+/attach        continue the latest Claude or Cursor session in this cwd
+/engine        tap to pick claude, codex, kimi, cursor, or grok
 /cd <path>     set working directory for this chat
 /repo <name>   shortcut for /cd ~/dev/<name>
 /repos         tap-to-switch repo buttons
@@ -1516,13 +1778,13 @@ Commands (answer instantly, even while the engine is working):
 /cost          today + last-7-days spend
 /file <what>   act on the last file sent (needed for forwarded files)
 /get <path>    send me a file from the Mac
-/sh <cmd>      raw shell command (bypasses Claude)
+/sh <cmd>      raw shell command (bypasses the engine)
 /log [n]       tail the bridge log
 /help          this message
 
-Messages sent while Claude is busy are queued and run in order.
+Messages sent while an engine is busy are queued and run in order.
 Long results arrive as a summary + attached .md file.
-Sessions resume across messages: "fix the test" then "now push it"."""
+From a terminal on this Mac: ll-hub send "fix the test"."""
 
 
 class Bridge:
@@ -1533,6 +1795,12 @@ class Bridge:
         self.state_lock = threading.RLock()
         self.started = time.time()
         self.workers = {}
+        self.bot_username = None
+        self.topics_enabled = None
+        self.webhook_clear = None
+        self.last_poll_at = 0
+        self.poller_running = False
+        self.hub = None
 
     @staticmethod
     def _load_state():
@@ -1683,15 +1951,22 @@ class Bridge:
                 advance_context(chat)
                 chat["session_id"] = None
                 chat["codex_session_id"] = None
+                chat["cursor_session_id"] = None
                 chat.pop("kimi_continue", None)
             reply("🆕 Fresh session. Cwd: " + chat["cwd"])
         elif stripped == "/attach":
+            engine = chat.get("engine", "claude")
             with self.state_lock:
                 advance_context(chat)
-                chat["session_id"] = CONTINUE
-                chat["engine"] = "claude"
+                if engine == "cursor":
+                    chat["cursor_session_id"] = CONTINUE
+                    chat["engine"] = "cursor"
+                else:
+                    chat["session_id"] = CONTINUE
+                    chat["engine"] = "claude"
+            target = "Cursor" if engine == "cursor" else "Claude"
             reply("🔗 next message continues the MOST RECENT "
-                  f"Claude session in {chat['cwd']}, including "
+                  f"{target} session in {chat['cwd']}, including "
                   "one started in the terminal.")
         elif stripped.startswith("/engine"):
             arg = (stripped.split(None, 1)[1].strip().lower()
@@ -1702,9 +1977,13 @@ class Bridge:
                 reply("tap to pick engine:",
                       reply_markup=kb([[("🤖 claude", "engine:claude"),
                                         ("🧭 codex", "engine:codex")],
-                                       [("🌙 kimi", "engine:kimi")]]))
+                                       [("🌙 kimi", "engine:kimi"),
+                                        ("🖱️ cursor", "engine:cursor")],
+                                       [("⚡ grok", "engine:grok")]]))
         elif stripped == "/status":
             reply(self._status_text(chat, w))
+        elif stripped == "/clients":
+            reply(self._clients_text())
         elif stripped.startswith("/cd ") or stripped.startswith("/repo "):
             arg = stripped.split(None, 1)[1].strip()
             path = (os.path.expanduser(arg) if stripped.startswith("/cd ")
@@ -1832,6 +2111,14 @@ class Bridge:
                      "repo, but filesystem reads may be broader. It ignores "
                      "custom user configuration unless enabled in "
                      "config.json.")
+        elif name == "cursor":
+            note += ("\nnote: Cursor agent runs with --trust"
+                     + (" and --force" if self.cfg.get("cursor_force", True)
+                        else "")
+                     + ". MCP servers are not auto-approved.")
+        elif name == "grok":
+            note += ("\nnote: Grok is one-shot; /model maps to grok -m. "
+                     "There is no resume flag on this CLI.")
         self.tg.send(chat_id, note, message_thread_id=thread_id)
 
     def _switch_dir(self, chat_id, chat, path, thread_id=None):
@@ -1841,6 +2128,7 @@ class Bridge:
                 chat["cwd"] = path
                 chat["session_id"] = None  # sessions are per-project
                 chat["codex_session_id"] = None
+                chat["cursor_session_id"] = None
                 chat.pop("kimi_continue", None)
             g = git_info(path)
             note = f"📁 cwd -> {path} (fresh session)"
@@ -1880,6 +2168,7 @@ class Bridge:
             lines.append(f"git: {g}")
         engine = chat.get("engine", "claude")
         sid = (chat.get("codex_session_id") if engine == "codex"
+               else chat.get("cursor_session_id") if engine == "cursor"
                else chat.get("session_id"))
         lines += [f"engine: {chat.get('engine', 'claude')}",
                   f"session: "
@@ -2006,6 +2295,106 @@ class Bridge:
 
     # ------------------------------------------------------------ main loop
 
+    def _clients_text(self):
+        username = self.bot_username or "the work bot"
+        return (
+            "Same hub, three clients.\n\n"
+            f"Telegram and Nicegram: @{username} in a private chat. "
+            "Topics stay isolated. Command menu is published to both.\n"
+            "CLI/API on this Mac: ll-hub status | send | engine | repo | stop\n"
+            "Mission Control reads health.json only. It does not hold the "
+            "bot token and cannot enqueue work.\n\n"
+            "Never start a second getUpdates poller on this token. "
+            "A 409 conflict means another process stole the bot."
+        )
+
+    def ensure_hub_dir(self, directory):
+        ensure_private_dir(directory)
+
+    def write_health(self):
+        payload = hub_local.health_from_bridge(self)
+        body = json.dumps(payload, indent=2, sort_keys=True,
+                          allow_nan=False) + "\n"
+        path = hub_local.health_path()
+        ensure_private_dir(os.path.dirname(path))
+        atomic_private_write(path, body)
+
+    def _hub_chat(self, request):
+        chat_id, thread_id = hub_local.select_hub_conversation(
+            self.cfg, request)
+        return chat_id, thread_id, self.chat_state(chat_id, thread_id)
+
+    def hub_send(self, request):
+        text = (request or {}).get("text")
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": "send requires a nonempty text field"}
+        if len(text) > 8000:
+            return {"ok": False, "error": "send text exceeds 8000 characters"}
+        chat_id, thread_id, _chat = self._hub_chat(request)
+        queued = self.worker(chat_id, thread_id).submit(text.strip())
+        self.save()
+        self.write_health()
+        return {"ok": True, "queued": queued, "engine":
+                self.chat_state(chat_id, thread_id).get("engine", "claude")}
+
+    def hub_stop(self, request):
+        chat_id, thread_id, _chat = self._hub_chat(request)
+        killed, drained = self.worker(chat_id, thread_id).stop_all()
+        self.write_health()
+        return {"ok": True, "killed": killed, "drained": drained}
+
+    def hub_set_engine(self, request):
+        name = str((request or {}).get("name") or "").strip().lower()
+        if name not in ENGINES:
+            return {"ok": False, "error": "engine must be claude, codex, "
+                    "kimi, cursor, or grok"}
+        chat_id, thread_id, chat = self._hub_chat(request)
+        self._set_engine(chat_id, chat, name, thread_id)
+        self.save()
+        self.write_health()
+        return {"ok": True, "engine": name}
+
+    def hub_set_cwd(self, request):
+        if (request or {}).get("op") == "repo":
+            name = str((request or {}).get("name") or "").strip()
+            if not name or "/" in name or name in (".", ".."):
+                return {"ok": False, "error": "repo name must be a ~/dev child"}
+            path = os.path.expanduser(f"~/dev/{name}")
+        else:
+            raw = str((request or {}).get("path") or "").strip()
+            if not raw:
+                return {"ok": False, "error": "cd requires a path"}
+            path = os.path.expanduser(raw)
+        if not os.path.isdir(path):
+            return {"ok": False, "error": f"not a directory: {path}"}
+        chat_id, thread_id, chat = self._hub_chat(request)
+        self._switch_dir(chat_id, chat, path, thread_id)
+        self.save()
+        self.write_health()
+        return {"ok": True, "cwd": path}
+
+    def publish_surface(self):
+        try:
+            info = self.tg.webhook_info()
+            self.webhook_clear = webhook_is_clear(info)
+            if not self.webhook_clear:
+                log("FATAL: a Telegram webhook is set; getUpdates will starve")
+                os._exit(1)
+        except Exception as exc:
+            log(f"webhook check failed: {exc}")
+            self.webhook_clear = None
+        try:
+            me = self.tg.call("getMe", timeout=15)
+            result = (me or {}).get("result") or {}
+            self.bot_username = result.get("username")
+            self.topics_enabled = bool(result.get("has_topics_enabled"))
+        except Exception as exc:
+            log(f"getMe failed: {exc}")
+        try:
+            self.tg.set_my_commands(BOT_COMMANDS)
+        except Exception as exc:
+            log(f"setMyCommands failed: {exc}")
+
     def _authorized(self, uid, chat):
         """Private 1-to-1 chat from a whitelisted user only."""
         return (chat.get("type") == "private"
@@ -2015,17 +2404,33 @@ class Bridge:
     def run(self):
         offset = self.state.get("offset", 0)
         allowed = set(self.cfg["allowed_user_ids"])
-        log(f"bridge v6 up; allowed users: "
-            f"{sorted(allowed) or 'NONE (setup mode)'}")
+        self.publish_surface()
+        self.hub = hub_local.HubServer(self)
+        try:
+            self.hub.start()
+        except Exception:
+            self.write_health()
+            raise
+        self.poller_running = True
+        self.write_health()
+        log(f"bridge v7 up; allowed users: "
+            f"{sorted(allowed) or 'NONE (setup mode)'}; "
+            f"hub socket {hub_local.socket_path()}")
         while True:
             for upd in self.tg.get_updates(offset):
                 offset = upd["update_id"] + 1
                 self.state["offset"] = offset
+                self.last_poll_at = int(time.time() * 1000)
                 self.save()
                 try:
                     self._dispatch(upd, allowed)
                 except Exception as e:
                     log(f"dispatch error: {e!r}")
+            self.last_poll_at = int(time.time() * 1000)
+            try:
+                self.write_health()
+            except Exception as exc:
+                log(f"health write failed: {exc}")
 
     def _dispatch(self, upd, allowed):
         cq = upd.get("callback_query")
@@ -2090,16 +2495,22 @@ def check(cfg):
 
     cli_checks = (
         ("claude", cfg["claude_bin"], ["--help"],
-         ("--strict-mcp-config", "--setting-sources", "--no-chrome")),
+         ("--strict-mcp-config", "--setting-sources", "--no-chrome"), True),
         ("codex", cfg["codex_bin"], ["exec", "--help"],
-         ("--ignore-user-config", "--ignore-rules", "--sandbox", "--json")),
+         ("--ignore-user-config", "--ignore-rules", "--sandbox", "--json"), True),
         ("kimi", cfg["kimi_bin"], ["--help"],
-         ("--prompt", "--output-format")),
+         ("--prompt", "--output-format"), True),
+        ("cursor", cfg["cursor_bin"], ["--help"],
+         ("--print", "--output-format", "--trust", "--force"), False),
+        ("grok", cfg["grok_bin"], ["--help"],
+         ("--single", "--cwd", "--output-format"), False),
     )
-    for label, binary, arguments, required in cli_checks:
+    for label, binary, arguments, required, required_engine in cli_checks:
         if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
-            print(f"✗ {label} binary missing: {binary}")
-            ok = False
+            mark = "✗" if required_engine else "!"
+            print(f"{mark} {label} binary missing: {binary}")
+            if required_engine:
+                ok = False
             continue
         try:
             proc = subprocess.run(
@@ -2108,12 +2519,14 @@ def check(cfg):
             help_text = proc.stdout + proc.stderr
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"✗ {label} capability check failed: {exc}")
-            ok = False
+            if required_engine:
+                ok = False
             continue
         missing = [flag for flag in required if flag not in help_text]
         if proc.returncode != 0 or missing:
             print(f"✗ {label} is missing required flags: {missing}")
-            ok = False
+            if required_engine:
+                ok = False
         else:
             print(f"✓ {label} binary and automation flags: {binary}")
     if os.path.isdir(cfg["default_cwd"]):
@@ -2136,6 +2549,13 @@ def check(cfg):
             print("✓ Telegram private-topic mode: "
                   + ("enabled" if me["result"].get("has_topics_enabled")
                      else "available, not enabled"))
+            webhook = Telegram(cfg["bot_token"]).webhook_info()
+            if webhook_is_clear(webhook):
+                print("✓ Telegram webhook is clear (getUpdates can run)")
+            else:
+                print("✗ a Telegram webhook is set; delete it or this Mac "
+                      "will never see updates")
+                ok = False
         except Exception as e:
             print(f"✗ Telegram API check failed: {e}")
             ok = False
@@ -2151,6 +2571,10 @@ def main():
                 "PYTHON BRIDGE_DIR HOME")
         render_launchd_plist(*sys.argv[2:])
         return
+    if sys.argv[1:2] == ["cli"] or (
+            sys.argv[1:2] and sys.argv[1] in (
+                "status", "send", "engine", "repo", "cd", "stop", "help")):
+        raise SystemExit(hub_local.cli_main(sys.argv[1:]))
     ensure_private_dir(INBOX_DIR)
     ensure_private_dir(OUTBOX_DIR)
     cfg = load_config()

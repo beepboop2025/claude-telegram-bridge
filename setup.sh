@@ -46,6 +46,23 @@ done
   exit 1
 }
 
+HUB_DIR="${HOME}/Library/Application Support/liquilens-agent-hub"
+install -d -m 0700 "$HUB_DIR"
+LOCAL_BIN="${HOME}/.local/bin"
+install -d -m 0755 "$LOCAL_BIN"
+HUB_CLI="${LOCAL_BIN}/ll-hub"
+[[ ! -L "$HUB_CLI" ]] || {
+  print -u2 "refusing symlinked ll-hub: $HUB_CLI"
+  exit 1
+}
+temporary_cli="$(mktemp "${LOCAL_BIN}/.ll-hub.XXXXXX")"
+{
+  print -- "#!/bin/zsh"
+  print -- "exec ${PYTHON} ${DIR}/bridge.py cli \"\$@\""
+} > "$temporary_cli"
+chmod 0700 "$temporary_cli"
+mv -f "$temporary_cli" "$HUB_CLI"
+
 install -d -m 0755 "$PLIST_DIR"
 [[ ! -L "$PLIST" ]] || {
   print -u2 "refusing symlinked LaunchAgent: $PLIST"
@@ -65,3 +82,4 @@ domain="gui/$(id -u)"
 launchctl bootout "$domain" "$PLIST" 2>/dev/null || true
 launchctl bootstrap "$domain" "$PLIST"
 print "✅ bridge loaded as ${LABEL}. Logs: tail -f $DIR/bridge.log"
+print "✅ local CLI: ll-hub status   (Telegram and Nicegram share this bot)"
