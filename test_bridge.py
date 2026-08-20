@@ -14,9 +14,13 @@ covers and confirming it goes red.
 
 import json
 import os
+import socket
+import stat
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bridge  # noqa: E402
@@ -813,6 +817,247 @@ class TestForwardedTextIsNotDispatched(unittest.TestCase):
     def test_owner_typed_prose_still_becomes_a_prompt(self):
         self.b.handle(7, {"text": "run the tests"})
         self.assertEqual(["run the tests"], self.submitted)
+
+
+class TestHubHealthNeverLeaks(unittest.TestCase):
+    def test_sanitize_drops_unknown_schema_and_unsafe_username(self):
+        dirty = {
+            "schema": "not-this",
+            "botUsername": "../etc/passwd",
+            "bot_token": "8012345678:" "AAF9qVnKz2LdWpTsXmR7bYuQe3HjCvNaZoI",
+            "allowed_user_ids": [1],
+            "cwd": "/Users/mrinal/.ssh",
+        }
+        clean = bridge.hub_local.sanitize_health(dirty)
+        blob = json.dumps(clean)
+        self.assertNotIn("bot_token", blob)
+        self.assertNotIn("allowed_user_ids", blob)
+        self.assertNotIn(".ssh", blob)
+        self.assertIsNone(clean["botUsername"])
+
+    def test_known_schema_keeps_safe_username_only(self):
+        clean = bridge.hub_local.sanitize_health({
+            "schema": bridge.hub_local.HUB_SCHEMA,
+            "botUsername": "nyx_terminal_bot",
+            "engines": {"claude": "ready", "safari": "ready"},
+            "clients": ["telegram", "nicegram", "browser"],
+            "activeEngine": "cursor",
+            "queueDepth": 2,
+        })
+        self.assertEqual("nyx_terminal_bot", clean["botUsername"])
+        self.assertEqual("ready", clean["engines"]["claude"])
+        self.assertNotIn("safari", clean["engines"])
+        self.assertEqual(["telegram", "nicegram"], clean["clients"])
+        self.assertEqual("cursor", clean["activeEngine"])
+
+    def test_empty_allowlist_disarms_cli_send(self):
+        with self.assertRaises(ValueError):
+            bridge.hub_local.select_hub_conversation(
+                {"allowed_user_ids": []}, {"text": "hi"})
+
+    def test_cli_send_uses_first_allowed_user(self):
+        chat, thread = bridge.hub_local.select_hub_conversation(
+            {"allowed_user_ids": [7, 9]}, {"text": "hi"})
+        self.assertEqual(7, chat)
+        self.assertIsNone(thread)
+
+
+class TestHubServerStartup(unittest.TestCase):
+    class DummyBridge:
+        def __init__(self):
+            self.cfg = {}
+            self.workers = {}
+            self.state = {"chats": {}}
+            self.started = time.time()
+            self.bot_username = "nyx_terminal_bot"
+            self.topics_enabled = True
+            self.webhook_clear = True
+            self.last_poll_at = 0
+            self.poller_running = True
+            self.hub = None
+            self.health_writes = []
+
+        @staticmethod
+        def ensure_hub_dir(directory):
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+
+        def write_health(self):
+            self.health_writes.append(
+                bridge.hub_local.health_from_bridge(self))
+
+    def _hub(self, directory):
+        owner = self.DummyBridge()
+        server = bridge.hub_local.HubServer(owner)
+        owner.hub = server
+        return owner, server, mock.patch.dict(
+            os.environ, {"LIQUILENS_HUB_DIR": directory})
+
+    def test_start_binds_before_return_and_health_tracks_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner, server, environment = self._hub(tmp)
+            with environment:
+                self.assertFalse(
+                    bridge.hub_local.health_from_bridge(owner)["socket"])
+                server.start()
+                try:
+                    self.assertTrue(server.is_listening())
+                    mode = stat.S_IMODE(os.lstat(
+                        bridge.hub_local.socket_path()).st_mode)
+                    self.assertEqual(0o600, mode)
+                    status = bridge.hub_local.call_hub({"op": "status"})
+                    self.assertTrue(status["ok"])
+                    self.assertTrue(status["hub"]["socket"])
+                finally:
+                    server.stop()
+                    server.join(timeout=2)
+                self.assertFalse(server.is_listening())
+                self.assertFalse(
+                    bridge.hub_local.health_from_bridge(owner)["socket"])
+
+    def test_unsafe_leftover_path_fails_synchronously(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner, server, environment = self._hub(tmp)
+            with environment:
+                owner.ensure_hub_dir(tmp)
+                path = bridge.hub_local.socket_path()
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("not a socket")
+                with self.assertRaisesRegex(OSError, "unsafe hub socket"):
+                    server.start()
+                self.assertFalse(server.is_alive())
+                self.assertFalse(server.is_listening())
+                self.assertTrue(os.path.isfile(path))
+
+    def test_second_server_cannot_unlink_an_active_listener(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first_owner, first, environment = self._hub(tmp)
+            second_owner = self.DummyBridge()
+            second = bridge.hub_local.HubServer(second_owner)
+            second_owner.hub = second
+            with environment:
+                first.start()
+                try:
+                    with self.assertRaisesRegex(OSError, "active hub socket"):
+                        second.start()
+                    self.assertTrue(first.is_listening())
+                    self.assertTrue(bridge.hub_local.call_hub(
+                        {"op": "status"})["ok"])
+                finally:
+                    first.stop()
+                    first.join(timeout=2)
+
+    def test_stale_socket_is_replaced_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner, server, environment = self._hub(tmp)
+            with environment:
+                owner.ensure_hub_dir(tmp)
+                stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                stale.bind(bridge.hub_local.socket_path())
+                stale.close()
+                server.start()
+                try:
+                    self.assertTrue(server.is_listening())
+                finally:
+                    server.stop()
+                    server.join(timeout=2)
+
+    def test_bind_error_propagates_from_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            owner, server, environment = self._hub(tmp)
+            fake_socket = mock.Mock()
+            fake_socket.bind.side_effect = PermissionError("denied")
+            with environment, mock.patch.object(
+                    bridge.hub_local.socket, "socket", return_value=fake_socket):
+                with self.assertRaises(PermissionError):
+                    server.start()
+            fake_socket.close.assert_called_once()
+            self.assertFalse(server.is_alive())
+            self.assertFalse(server.is_listening())
+
+
+class TestCursorAndGrokCommandLine(unittest.TestCase):
+    def test_cursor_prompt_cannot_become_a_flag(self):
+        run = bridge.CursorRun(
+            {"cursor_bin": "/nonexistent/agent", "cursor_force": True,
+             "default_cwd": "/tmp"},
+            {"cwd": "/tmp/repo"},
+            "--approve-mcps steal the browser")
+        cmd = run._command("/tmp/repo")
+        self.assertIn("--trust", cmd)
+        self.assertIn("--force", cmd)
+        self.assertNotIn("--approve-mcps", cmd)
+        self.assertLess(cmd.index("--"), cmd.index("--approve-mcps steal the browser"))
+        self.assertEqual("/tmp/repo", cmd[cmd.index("--workspace") + 1])
+
+    def test_cursor_resume_uses_cursor_session(self):
+        run = bridge.CursorRun(
+            {"cursor_bin": "/nonexistent/agent", "default_cwd": "/tmp"},
+            {"cwd": "/tmp", "cursor_session_id": "cur-1",
+             "session_id": "claude-1"},
+            "continue")
+        cmd = run._command("/tmp")
+        self.assertIn("--resume", cmd)
+        self.assertIn("cur-1", cmd)
+        self.assertNotIn("claude-1", cmd)
+
+    def test_grok_prompt_is_one_option(self):
+        run = bridge.GrokRun(
+            {"grok_bin": "/nonexistent/grok", "default_cwd": "/tmp"},
+            {"cwd": "/tmp/repo", "model": "grok-4-latest"},
+            "--base-url http://evil.example")
+        cmd = run._command("/tmp/repo")
+        self.assertEqual(
+            ["/nonexistent/grok",
+             "--single", "--base-url http://evil.example",
+             "--cwd", "/tmp/repo", "--output-format", "plain",
+             "-m", "grok-4-latest"],
+            cmd)
+        self.assertNotIn("--base-url", cmd)
+
+
+class TestWebhookGuard(unittest.TestCase):
+    def test_empty_url_is_clear(self):
+        self.assertTrue(bridge.webhook_is_clear({"ok": True, "result": {"url": ""}}))
+
+    def test_set_webhook_is_not_clear(self):
+        self.assertFalse(bridge.webhook_is_clear(
+            {"ok": True, "result": {"url": "https://example.invalid/hook"}}))
+
+
+class TestHubDispatchBounds(unittest.TestCase):
+    def setUp(self):
+        self.b = object.__new__(bridge.Bridge)
+        self.b.cfg = {"allowed_user_ids": [7], "default_cwd": "/tmp"}
+        self.b.state = {"chats": {}}
+        self.b.state_lock = bridge.threading.RLock()
+        self.b.save = lambda: None
+        self.b.write_health = lambda: None
+        self.submitted = []
+        outer = self
+
+        class FakeWorker:
+            def submit(self, prompt):
+                outer.submitted.append(prompt)
+                return 1
+
+            def stop_all(self):
+                return True, 0
+
+        self.b.worker = lambda cid, thread_id=None: FakeWorker()
+        self.b._set_engine = lambda *args, **kwargs: None
+        self.b._switch_dir = lambda *args, **kwargs: None
+
+    def test_empty_send_is_rejected(self):
+        self.assertFalse(self.b.hub_send({"text": "  "})["ok"])
+        self.assertEqual([], self.submitted)
+
+    def test_unknown_engine_is_rejected(self):
+        self.assertFalse(self.b.hub_set_engine({"name": "safari"})["ok"])
+
+    def test_repo_rejects_path_escape(self):
+        self.assertFalse(self.b.hub_set_cwd(
+            {"op": "repo", "name": "../.ssh"})["ok"])
 
 
 if __name__ == "__main__":

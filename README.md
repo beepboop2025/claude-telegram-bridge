@@ -1,9 +1,11 @@
-# claude-telegram-bridge (v6)
+# claude-telegram-bridge (v7)
 
-Use Claude Code on this Mac from Telegram, anywhere. Messages you send to
-your private bot run headless Claude Code (`claude -p`, full permissions)
-in a chosen repo; results come back to the chat. Sessions resume across
-messages, so "fix the test" then "now commit and push" works.
+Use Claude, Codex, Kimi, Cursor, and Grok on this Mac from Telegram or
+Nicegram, anywhere. The same private bot is the only Telegram poller.
+Terminal LLMs and Mission Control attach through `ll-hub` so they never
+steal `getUpdates`. Results come back to the chat both clients already
+show. Sessions resume across messages, so "fix the test" then "now
+commit and push" works.
 
 v3: everything v2 had (streaming progress, non-blocking worker, queueing,
 file transfer, model override) plus: tap-to-stop button on the progress
@@ -36,6 +38,11 @@ responses and file transfers are bounded, config and state JSON are strict,
 and credential-bearing local artifacts are atomically stored as owner-only
 files. The launchd installer now validates and atomically replaces its plist.
 
+v7: **one hub, many clients**. Cursor (`agent -p`) and Grok (`grok --single`)
+are optional engines. `ll-hub` is a local Unix-socket CLI. Mission Control
+reads `health.json` only. `setMyCommands` and a webhook check keep Telegram
+and Nicegram on the same bot. A second poller still exits on 409.
+
 Stdlib-only Python, long polling (no ports, no webhook, works behind NAT),
 IPv4-forced (this network black-holes some IPv6).
 
@@ -62,12 +69,38 @@ IPv4-forced (this network black-holes some IPv6).
 | `/cd <path>` | switch to any directory |
 | `/new` | fresh Claude session |
 | `/model` | tap-to-pick model: **fable 5** / opus / sonnet / haiku (`/model haiku` also works) |
-| `/engine` | tap to pick 🤖 claude, 🧭 codex, or 🌙 kimi |
-| `/attach` | continue the latest Claude session in this cwd (terminal handoff) |
+| `/engine` | tap to pick claude, codex, kimi, cursor, or grok |
+| `/attach` | continue the latest Claude or Cursor session in this cwd |
+| `/clients` | how Telegram, Nicegram, and `ll-hub` share this bot |
 | `/get <path>` | send a file from the Mac to the chat (≤50MB) |
-| `/sh git status` | raw shell command, no Claude |
+| `/sh git status` | raw shell command, no engine |
 | `/log 50` | tail the bridge log |
 | `/status` | busy/idle, cwd, session, model, queue, uptime |
+
+## Local CLI and Nicegram
+
+Nicegram is a Telegram client. There is no second bot API. Message the same
+bot from either app. Private topics and the command menu appear in both.
+
+On this Mac, do not start another poller. Use the local CLI:
+
+```bash
+ll-hub status
+ll-hub engine cursor
+ll-hub repo LiquiLens
+ll-hub send "fix the test"
+ll-hub stop
+```
+
+`ll-hub send` enqueues on the same worker Telegram uses. The result lands
+in the private chat, so it is visible in Telegram and Nicegram.
+
+Mission Control observes
+`~/Library/Application Support/liquilens-agent-hub/health.json`.
+It does not read the bot token and cannot enqueue work. The bridge binds and
+listens on the owner-only socket before it publishes healthy startup. An unsafe
+leftover path, permission/bind failure, or already-active Hub makes startup fail
+closed; `health.json` reports `socket: false` if the listener later stops.
 
 Messages sent while an engine is busy are queued and run in order. Each
 private-chat topic has an independent worker, repository, and resumable
@@ -147,7 +180,7 @@ covered by `python3 test_bridge.py`:
 Not covered: `/sh` is a full shell by design, and the Kimi engine has no
 per-invocation MCP flag (it loads only `openclaw`).
 
-Optional security controls in `config.json` retain these v6 defaults:
+Optional security controls in `config.json` retain these v7 defaults:
 
 ```json
 {
@@ -155,6 +188,13 @@ Optional security controls in `config.json` retain these v6 defaults:
   "claude_setting_sources": "project",
   "codex_ignore_user_config": true,
   "codex_ignore_rules": true,
-  "codex_sandbox": "workspace-write"
+  "codex_sandbox": "workspace-write",
+  "cursor_force": true,
+  "cursor_bin": "~/.local/bin/agent",
+  "grok_bin": "~/.local/bin/grok"
 }
 ```
+
+Cursor MCP servers are not auto-approved. Set `cursor_force` to false only
+if you accept hung approval prompts on the phone. If `grok` lives on PATH
+instead of `~/.local/bin/grok`, the bridge picks that up at startup.
