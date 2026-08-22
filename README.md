@@ -116,6 +116,9 @@ blocks on an engine.
 - Refresh: `./setup.sh`
 - Stop: `launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.beepboop2025.claude-telegram-bridge.plist`
 - Health check: `python3 bridge.py --check`
+- Codex binary: an explicit `codex_bin` in `config.json` wins. Otherwise the
+  bridge follows the standalone install's stable `~/.local/bin/codex` symlink,
+  then looks on `PATH`; `--check` fails loudly if neither is executable.
 
 ## Security model
 

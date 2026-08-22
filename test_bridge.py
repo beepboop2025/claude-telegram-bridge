@@ -445,6 +445,49 @@ class TestCodexCommandLine(unittest.TestCase):
         self.assertEqual("⏱ timed out after 7s", run._stopped_text())
 
 
+class TestCodexBinaryDiscovery(unittest.TestCase):
+    def test_stable_standalone_symlink_wins_over_path(self):
+        stable = os.path.expanduser("~/.local/bin/codex")
+        with mock.patch.object(bridge.os.path, "isfile",
+                               side_effect=lambda path: path == stable), \
+                mock.patch.object(bridge.os, "access", return_value=True), \
+                mock.patch.object(bridge.shutil, "which",
+                                  return_value="/opt/homebrew/bin/codex"):
+            self.assertEqual(stable, bridge.default_codex_bin())
+
+    def test_path_is_used_when_stable_install_is_absent(self):
+        with mock.patch.object(bridge.os.path, "isfile", return_value=False), \
+                mock.patch.object(bridge.shutil, "which",
+                                  return_value="/opt/homebrew/bin/codex"):
+            self.assertEqual(
+                "/opt/homebrew/bin/codex", bridge.default_codex_bin()
+            )
+
+    def test_missing_install_returns_actionable_stable_path(self):
+        with mock.patch.object(bridge.os.path, "isfile", return_value=False), \
+                mock.patch.object(bridge.shutil, "which", return_value=None):
+            self.assertEqual(
+                os.path.expanduser("~/.local/bin/codex"),
+                bridge.default_codex_bin(),
+            )
+
+    def test_explicit_config_override_remains_authoritative(self):
+        raw = json.dumps({
+            "bot_token": "synthetic-token",
+            "allowed_user_ids": [7],
+            "codex_bin": "/operator/pinned/codex",
+        }).encode()
+        with mock.patch.object(bridge, "read_private", return_value=raw), \
+                mock.patch.object(
+                    bridge, "default_codex_bin",
+                    side_effect=AssertionError("default must not be consulted"),
+                ):
+            cfg = bridge.load_config()
+        self.assertEqual(
+            os.path.realpath("/operator/pinned/codex"), cfg["codex_bin"]
+        )
+
+
 class TestCodexProgress(unittest.TestCase):
     def test_command_is_compact(self):
         text = bridge.describe_codex_item({

@@ -501,6 +501,21 @@ def force_ipv4():
     socket.getaddrinfo = ipv4_only
 
 
+def default_codex_bin():
+    """Find the maintained Codex CLI without pinning an app-bundle layout.
+
+    The standalone installer keeps ``~/.local/bin/codex`` as its stable
+    symlink while versioned package paths move during upgrades.  PATH is a
+    secondary escape hatch for other supported installations.  Returning the
+    stable candidate when neither exists keeps ``--check`` diagnostics exact.
+    """
+    stable = os.path.expanduser("~/.local/bin/codex")
+    if os.path.isfile(stable) and os.access(stable, os.X_OK):
+        return stable
+    found = shutil.which("codex")
+    return found or stable
+
+
 def load_config():
     cfg = strict_json_loads(read_private(CONFIG_PATH), CONFIG_PATH)
     if not isinstance(cfg, dict):
@@ -509,8 +524,8 @@ def load_config():
     cfg.setdefault("default_cwd", os.path.expanduser("~/dev"))
     cfg.setdefault("claude_bin", os.path.expanduser("~/.local/bin/claude"))
     cfg.setdefault("kimi_bin", os.path.expanduser("~/.kimi-code/bin/kimi"))
-    cfg.setdefault("codex_bin",
-                   "/Applications/ChatGPT.app/Contents/Resources/codex")
+    if "codex_bin" not in cfg:
+        cfg["codex_bin"] = default_codex_bin()
     cfg.setdefault("cursor_bin", os.path.expanduser("~/.local/bin/agent"))
     cfg.setdefault("grok_bin", os.path.expanduser("~/.local/bin/grok"))
     cfg.setdefault("claude_timeout_sec", 3600)
